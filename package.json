@@ -1,6 +1,6 @@
 {
   "name": "@itcustomsolution/sam-gov-mcp",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "MCP server for searching SAM.gov contract opportunities (read-only, bring your own free SAM.gov API key)",
   "main": "dist/server.js",
   "scripts": {
