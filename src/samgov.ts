@@ -50,11 +50,11 @@ export interface OpportunitySummary {
   uiLink?: string;
 }
 
-export type FetchLike = (url: string, init?: { headers?: Record<string, string> }) => Promise<{
+/** Minimal fetch shape. `body` must be a byte stream; the client never calls text()/json(). */
+export type FetchLike = (url: string, init?: { headers?: Record<string, string>; signal?: AbortSignal }) => Promise<{
   ok: boolean;
   status: number;
-  json(): Promise<any>;
-  text(): Promise<string>;
+  body: ReadableStream<Uint8Array> | null;
 }>;
 
 export class SamGovError extends Error {
@@ -138,6 +138,50 @@ export function redactKey(s: string, key?: string): string {
 
 /** Hard cap on how much of an upstream response we will read (defends against huge/malicious bodies). */
 export const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
+/** Error bodies are only quoted (300 chars), so read at most this much of them. */
+export const MAX_ERROR_BODY_BYTES = 16 * 1024;
+
+/** Recursively redact every string (keys and values) in a parsed JSON value. */
+export function redactDeep<T>(value: T, key?: string): T {
+  if (typeof value === "string") return redactKey(value, key) as unknown as T;
+  if (Array.isArray(value)) return value.map((v) => redactDeep(v, key)) as unknown as T;
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[redactKey(k, key)] = redactDeep(v, key);
+    return out as T;
+  }
+  return value;
+}
+
+export class ResponseTooLarge extends Error {}
+
+/**
+ * Read a byte stream, counting bytes as they arrive and cancelling the stream as soon as the
+ * running total exceeds `max`. At most `max` bytes plus one chunk are ever held. Decoding is
+ * streaming UTF-8, so multibyte characters split across chunks are handled.
+ */
+export async function readCapped(body: ReadableStream<Uint8Array> | null, max: number): Promise<string> {
+  if (!body) return "";
+  const reader = body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let total = 0;
+  let out = "";
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > max) {
+        await reader.cancel("response exceeds size cap").catch(() => {});
+        throw new ResponseTooLarge(`response exceeds ${max} bytes`);
+      }
+      out += decoder.decode(value, { stream: true });
+    }
+    return out + decoder.decode();
+  } finally {
+    reader.releaseLock?.();
+  }
+}
 
 export class SamGovClient {
   constructor(
@@ -159,11 +203,21 @@ export class SamGovClient {
     // Per the Get Opportunities API docs, HTTP 404 means "No Data found", not an error.
     if (res.status === 404) return { totalRecords: 0, opportunitiesData: [] };
     if (!res.ok) {
-      const body = redactKey(await res.text().catch(() => ""), this.apiKey);
-      throw new SamGovError(`SAM.gov returned HTTP ${res.status}: ${body.slice(0, 300)}`, res.status);
+      let body: string;
+      try {
+        body = await readCapped(res.body, MAX_ERROR_BODY_BYTES);
+      } catch (e) {
+        body = e instanceof ResponseTooLarge ? "(error body too large; not read)" : "(error body could not be read)";
+      }
+      throw new SamGovError(`SAM.gov returned HTTP ${res.status}: ${redactKey(body, this.apiKey).slice(0, 300)}`, res.status);
     }
-    const raw = await res.text();
-    if (raw.length > MAX_RESPONSE_BYTES) throw new SamGovError("SAM.gov response too large; narrow the search.");
+    let raw: string;
+    try {
+      raw = await readCapped(res.body, MAX_RESPONSE_BYTES);
+    } catch (e) {
+      if (e instanceof ResponseTooLarge) throw new SamGovError("SAM.gov response too large; narrow the search.");
+      throw new SamGovError(`Failed reading SAM.gov response: ${redactKey(String((e as Error)?.message ?? e), this.apiKey)}`);
+    }
     try {
       return JSON.parse(raw);
     } catch {
@@ -174,7 +228,7 @@ export class SamGovClient {
   async search(p: SearchParams): Promise<{ total: number; results: OpportunitySummary[] }> {
     const data = await this.get(buildSearchUrl(this.apiKey, p, this.base));
     const list = Array.isArray(data?.opportunitiesData) ? data.opportunitiesData : [];
-    return JSON.parse(redactKey(JSON.stringify({ total: Number(data?.totalRecords ?? list.length), results: list.map(summarize) }), this.apiKey));
+    return redactDeep({ total: Number(data?.totalRecords ?? list.length), results: list.map(summarize) }, this.apiKey);
   }
 
   async getOpportunity(noticeId: string, lookbackDays = 365): Promise<any | null> {
@@ -187,6 +241,6 @@ export class SamGovClient {
     const data = await this.get(url);
     const o = data?.opportunitiesData?.[0];
     if (!o) return null;
-    return JSON.parse(redactKey(JSON.stringify(o), this.apiKey));
+    return redactDeep(o, this.apiKey);
   }
 }
