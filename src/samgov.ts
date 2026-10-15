@@ -66,9 +66,15 @@ export class SamGovError extends Error {
 
 /** Accepts yyyy-mm-dd or MM/dd/yyyy and returns MM/dd/yyyy (the format SAM.gov requires). */
 export function toSamDate(input: string): string {
-  const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(input.trim());
-  if (iso) return `${iso[2]}/${iso[3]}/${iso[1]}`;
-  if (/^\d{2}\/\d{2}\/\d{4}$/.test(input.trim())) return input.trim();
+  const t = input.trim();
+  const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(t);
+  const us = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(t);
+  const [y, m, d]: string[] = iso ? [iso[1], iso[2], iso[3]] : us ? [us[3], us[1], us[2]] : ["", "", ""];
+  if (y) {
+    const dt = new Date(Date.UTC(+y, +m - 1, +d));
+    // Reject impossible dates like 2026-13-45 instead of silently rolling them over.
+    if (dt.getUTCFullYear() === +y && dt.getUTCMonth() === +m - 1 && dt.getUTCDate() === +d) return `${m}/${d}/${y}`;
+  }
   throw new SamGovError(`Invalid date "${input}". Use YYYY-MM-DD or MM/DD/YYYY.`);
 }
 
@@ -95,7 +101,7 @@ export function buildSearchUrl(apiKey: string, p: SearchParams, base = SAM_BASE_
     q.set("ncode", p.naics);
   }
   if (p.setAside) {
-    if (!(p.setAside in SET_ASIDE_CODES))
+    if (!Object.prototype.hasOwnProperty.call(SET_ASIDE_CODES, p.setAside))
       throw new SamGovError(`Unknown set-aside code "${p.setAside}". Call list_set_aside_codes.`);
     q.set("typeOfSetAside", p.setAside);
   }
@@ -123,9 +129,15 @@ export function summarize(o: any): OpportunitySummary {
 }
 
 /** Removes the api_key query value from any string (e.g. links echoed by the API). */
-export function redactKey(s: string): string {
-  return s.replace(/api_key=[^&\s"]+/gi, "api_key=REDACTED");
+export function redactKey(s: string, key?: string): string {
+  let out = s.replace(/api_key=[^&\s"']+/gi, "api_key=REDACTED");
+  // Also remove the literal key wherever an upstream error might echo it.
+  if (key && key.length >= 8) out = out.split(key).join("REDACTED");
+  return out;
 }
+
+/** Hard cap on how much of an upstream response we will read (defends against huge/malicious bodies). */
+export const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
 
 export class SamGovClient {
   constructor(
@@ -137,20 +149,32 @@ export class SamGovClient {
   }
 
   private async get(url: string): Promise<any> {
-    const res = await this.fetchImpl(url, { headers: { Accept: "application/json" } });
+    let res;
+    try {
+      res = await this.fetchImpl(url, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(30_000) } as any);
+    } catch (e) {
+      // Network errors can carry the request URL (which contains the key); never pass them through raw.
+      throw new SamGovError(`Could not reach SAM.gov: ${redactKey(String((e as Error)?.message ?? e), this.apiKey)}`);
+    }
     // Per the Get Opportunities API docs, HTTP 404 means "No Data found", not an error.
     if (res.status === 404) return { totalRecords: 0, opportunitiesData: [] };
     if (!res.ok) {
-      const body = redactKey(await res.text().catch(() => ""));
+      const body = redactKey(await res.text().catch(() => ""), this.apiKey);
       throw new SamGovError(`SAM.gov returned HTTP ${res.status}: ${body.slice(0, 300)}`, res.status);
     }
-    return res.json();
+    const raw = await res.text();
+    if (raw.length > MAX_RESPONSE_BYTES) throw new SamGovError("SAM.gov response too large; narrow the search.");
+    try {
+      return JSON.parse(raw);
+    } catch {
+      throw new SamGovError("SAM.gov returned a non-JSON response.");
+    }
   }
 
   async search(p: SearchParams): Promise<{ total: number; results: OpportunitySummary[] }> {
     const data = await this.get(buildSearchUrl(this.apiKey, p, this.base));
     const list = Array.isArray(data?.opportunitiesData) ? data.opportunitiesData : [];
-    return { total: Number(data?.totalRecords ?? list.length), results: list.map(summarize) };
+    return JSON.parse(redactKey(JSON.stringify({ total: Number(data?.totalRecords ?? list.length), results: list.map(summarize) }), this.apiKey));
   }
 
   async getOpportunity(noticeId: string, lookbackDays = 365): Promise<any | null> {
@@ -163,6 +187,6 @@ export class SamGovClient {
     const data = await this.get(url);
     const o = data?.opportunitiesData?.[0];
     if (!o) return null;
-    return JSON.parse(redactKey(JSON.stringify(o)));
+    return JSON.parse(redactKey(JSON.stringify(o), this.apiKey));
   }
 }

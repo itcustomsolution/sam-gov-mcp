@@ -103,3 +103,35 @@ describe("HTTP 404 from SAM.gov", () => {
     expect(r).toEqual({ total: 0, results: [] });
   });
 });
+
+describe("security audit regressions", () => {
+  const KEY = "LIVEKEY-abcdef1234567890";
+  it("exploit: upstream error echoing the raw key does not leak it", async () => {
+    const f = vi.fn(async () => ({ ok: false, status: 403, json: async () => ({}), text: async () => `invalid key ${KEY} supplied` }));
+    await expect(new SamGovClient(KEY, f as any).search({ postedFrom: "2026-01-01", postedTo: "2026-01-02" })).rejects.toThrow(/REDACTED/);
+    await expect(new SamGovClient(KEY, f as any).search({ postedFrom: "2026-01-01", postedTo: "2026-01-02" })).rejects.not.toThrow(new RegExp(KEY));
+  });
+  it("exploit: network error carrying the request URL does not leak the key", async () => {
+    const f = vi.fn(async (u: string) => { throw new Error(`connect ECONNREFUSED ${u}`); });
+    const err = await new SamGovClient(KEY, f as any).search({ postedFrom: "2026-01-01", postedTo: "2026-01-02" }).catch((e) => e);
+    expect(String(err.message)).not.toContain(KEY);
+  });
+  it("exploit: key echoed anywhere in result JSON is redacted", async () => {
+    const body = { totalRecords: 1, opportunitiesData: [{ noticeId: "n1", title: `see ${KEY}` }] };
+    const r = await new SamGovClient(KEY, okFetch(body) as any).search({ postedFrom: "2026-01-01", postedTo: "2026-01-02" });
+    expect(JSON.stringify(r)).not.toContain(KEY);
+  });
+  it("exploit: oversized response is refused", async () => {
+    const big = "x".repeat(5 * 1024 * 1024 + 1);
+    const f = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({}), text: async () => big }));
+    await expect(new SamGovClient(KEY, f as any).search({ postedFrom: "2026-01-01", postedTo: "2026-01-02" })).rejects.toThrow(/too large/);
+  });
+  it("exploit: prototype keys are not accepted as set-aside codes", () => {
+    for (const k of ["constructor", "toString", "__proto__"])
+      expect(() => buildSearchUrl("K", { postedFrom: "2026-01-01", postedTo: "2026-01-02", setAside: k })).toThrow(/set-aside/);
+  });
+  it("impossible dates are rejected, not rolled over", () => {
+    expect(() => toSamDate("2026-13-45")).toThrow(SamGovError);
+    expect(() => toSamDate("02/30/2026")).toThrow(SamGovError);
+  });
+});
