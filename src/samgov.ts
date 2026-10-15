@@ -138,6 +138,8 @@ export class SamGovClient {
 
   private async get(url: string): Promise<any> {
     const res = await this.fetchImpl(url, { headers: { Accept: "application/json" } });
+    // Per the Get Opportunities API docs, HTTP 404 means "No Data found", not an error.
+    if (res.status === 404) return { totalRecords: 0, opportunitiesData: [] };
     if (!res.ok) {
       const body = redactKey(await res.text().catch(() => ""));
       throw new SamGovError(`SAM.gov returned HTTP ${res.status}: ${body.slice(0, 300)}`, res.status);

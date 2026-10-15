@@ -94,3 +94,12 @@ describe("MCP server", () => {
     expect(JSON.parse(r.content[0].text).some((x: any) => x.code === "SDVOSBC")).toBe(true);
   });
 });
+
+describe("HTTP 404 from SAM.gov", () => {
+  it("is treated as no results, not an error", async () => {
+    const f = async () => ({ ok: false, status: 404, text: async () => "", json: async () => ({}) });
+    const c = new SamGovClient("k", f as any);
+    const r = await c.search({ postedFrom: "2026-09-01", postedTo: "2026-10-01" } as any);
+    expect(r).toEqual({ total: 0, results: [] });
+  });
+});
