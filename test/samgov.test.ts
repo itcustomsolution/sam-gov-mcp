@@ -14,7 +14,12 @@ const sample = {
     links: [{ href: "https://api.sam.gov/x?api_key=SECRET123" }],
   }],
 };
-const okFetch = (body: any) => vi.fn(async (_u: string) => ({ ok: true, status: 200, json: async () => body, text: async () => JSON.stringify(body) }));
+const streamOf = (str: string, chunk = 1024) => {
+  const bytes = new TextEncoder().encode(str);
+  let i = 0;
+  return new ReadableStream<Uint8Array>({ pull(c) { if (i >= bytes.length) return c.close(); c.enqueue(bytes.slice(i, i + chunk)); i += chunk; } });
+};
+const okFetch = (body: any) => vi.fn(async (_u: string) => ({ ok: true, status: 200, body: streamOf(JSON.stringify(body)) }));
 
 describe("helpers", () => {
   it("converts dates", () => {
@@ -54,7 +59,7 @@ describe("client", () => {
     expect(JSON.stringify(o)).not.toContain("SECRET123");
   });
   it("surfaces HTTP errors without leaking key", async () => {
-    const f = vi.fn(async () => ({ ok: false, status: 403, json: async () => ({}), text: async () => "bad api_key=K" }));
+    const f = vi.fn(async () => ({ ok: false, status: 403, body: streamOf("bad api_key=K") }));
     await expect(new SamGovClient("K", f as any).search({ postedFrom: "2026-09-01", postedTo: "2026-09-02" })).rejects.toThrow(/403.*REDACTED/);
   });
 });
@@ -97,7 +102,7 @@ describe("MCP server", () => {
 
 describe("HTTP 404 from SAM.gov", () => {
   it("is treated as no results, not an error", async () => {
-    const f = async () => ({ ok: false, status: 404, text: async () => "", json: async () => ({}) });
+    const f = async () => ({ ok: false, status: 404, body: streamOf("") });
     const c = new SamGovClient("k", f as any);
     const r = await c.search({ postedFrom: "2026-09-01", postedTo: "2026-10-01" } as any);
     expect(r).toEqual({ total: 0, results: [] });
@@ -107,7 +112,7 @@ describe("HTTP 404 from SAM.gov", () => {
 describe("security audit regressions", () => {
   const KEY = "LIVEKEY-abcdef1234567890";
   it("exploit: upstream error echoing the raw key does not leak it", async () => {
-    const f = vi.fn(async () => ({ ok: false, status: 403, json: async () => ({}), text: async () => `invalid key ${KEY} supplied` }));
+    const f = vi.fn(async () => ({ ok: false, status: 403, body: streamOf(`invalid key ${KEY} supplied`) }));
     await expect(new SamGovClient(KEY, f as any).search({ postedFrom: "2026-01-01", postedTo: "2026-01-02" })).rejects.toThrow(/REDACTED/);
     await expect(new SamGovClient(KEY, f as any).search({ postedFrom: "2026-01-01", postedTo: "2026-01-02" })).rejects.not.toThrow(new RegExp(KEY));
   });
@@ -121,11 +126,6 @@ describe("security audit regressions", () => {
     const r = await new SamGovClient(KEY, okFetch(body) as any).search({ postedFrom: "2026-01-01", postedTo: "2026-01-02" });
     expect(JSON.stringify(r)).not.toContain(KEY);
   });
-  it("exploit: oversized response is refused", async () => {
-    const big = "x".repeat(5 * 1024 * 1024 + 1);
-    const f = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({}), text: async () => big }));
-    await expect(new SamGovClient(KEY, f as any).search({ postedFrom: "2026-01-01", postedTo: "2026-01-02" })).rejects.toThrow(/too large/);
-  });
   it("exploit: prototype keys are not accepted as set-aside codes", () => {
     for (const k of ["constructor", "toString", "__proto__"])
       expect(() => buildSearchUrl("K", { postedFrom: "2026-01-01", postedTo: "2026-01-02", setAside: k })).toThrow(/set-aside/);
@@ -133,5 +133,72 @@ describe("security audit regressions", () => {
   it("impossible dates are rejected, not rolled over", () => {
     expect(() => toSamDate("2026-13-45")).toThrow(SamGovError);
     expect(() => toSamDate("02/30/2026")).toThrow(SamGovError);
+  });
+});
+
+describe("streamed body limits (independent audit follow-up)", async () => {
+  const { readCapped, MAX_RESPONSE_BYTES, MAX_ERROR_BODY_BYTES, redactDeep } = await import("../src/samgov.js");
+  const KEY = "LIVEKEY-abcdef1234567890";
+  // A synthetic stream that would be endless; counts pulled chunks and records cancellation.
+  const endless = (chunk = 64 * 1024) => {
+    const st = { pulled: 0, cancelled: false };
+    const stream = new ReadableStream<Uint8Array>({
+      pull(c) { st.pulled++; if (st.pulled > 10_000) return c.error(new Error("test safety stop")); c.enqueue(new Uint8Array(chunk).fill(0x61)); },
+      cancel() { st.cancelled = true; },
+    }, { highWaterMark: 0 });
+    return { stream, st };
+  };
+
+  it("streamed overflow on success path stops reading at the cap and cancels", async () => {
+    const { stream, st } = endless();
+    const f = vi.fn(async () => ({ ok: true, status: 200, body: stream }));
+    await expect(new SamGovClient(KEY, f as any).search({ postedFrom: "2026-01-01", postedTo: "2026-01-02" })).rejects.toThrow(/too large/);
+    expect(st.cancelled).toBe(true);
+    // never pulled more than cap/chunk + small read-ahead: proves no unbounded allocation
+    expect(st.pulled).toBeLessThanOrEqual(Math.ceil(MAX_RESPONSE_BYTES / (64 * 1024)) + 3);
+  });
+
+  it("error-body overflow reads at most the error cap and cancels", async () => {
+    const { stream, st } = endless(4096);
+    const f = vi.fn(async () => ({ ok: false, status: 500, body: stream }));
+    await expect(new SamGovClient(KEY, f as any).search({ postedFrom: "2026-01-01", postedTo: "2026-01-02" })).rejects.toThrow(/HTTP 500: \(error body too large/);
+    expect(st.cancelled).toBe(true);
+    expect(st.pulled).toBeLessThanOrEqual(Math.ceil(MAX_ERROR_BODY_BYTES / 4096) + 3);
+  });
+
+  it("multibyte UTF-8 split across chunks decodes correctly", async () => {
+    const txt = JSON.stringify({ totalRecords: 1, opportunitiesData: [{ noticeId: "n", title: "Café — 日本語 ✓" }] });
+    const r = await new SamGovClient(KEY, (async () => ({ ok: true, status: 200, body: streamOf(txt, 1) })) as any)
+      .search({ postedFrom: "2026-01-01", postedTo: "2026-01-02" });
+    expect(r.results[0].title).toBe("Café — 日本語 ✓");
+  });
+
+  it("byte cap counts bytes, not UTF-16 chars", async () => {
+    await expect(readCapped(streamOf("é".repeat(6)), 11)).rejects.toThrow(/exceeds/); // 12 bytes
+    expect(await readCapped(streamOf("é".repeat(5)), 11)).toBe("ééééé");
+  });
+
+  it("body-read failure becomes a redacted SamGovError", async () => {
+    const stream = new ReadableStream<Uint8Array>({ pull(c) { c.error(new Error(`socket reset for api_key=${KEY}`)); } });
+    const err = await new SamGovClient(KEY, (async () => ({ ok: true, status: 200, body: stream })) as any)
+      .search({ postedFrom: "2026-01-01", postedTo: "2026-01-02" }).catch((e) => e);
+    expect(err).toBeInstanceOf(SamGovError);
+    expect(err.message).toMatch(/Failed reading/);
+    expect(err.message).not.toContain(KEY);
+  });
+
+  it("error-body read failure still yields a clean SamGovError", async () => {
+    const stream = new ReadableStream<Uint8Array>({ pull(c) { c.error(new Error("boom")); } });
+    await expect(new SamGovClient(KEY, (async () => ({ ok: false, status: 502, body: stream })) as any)
+      .search({ postedFrom: "2026-01-01", postedTo: "2026-01-02" })).rejects.toThrow(/HTTP 502: \(error body could not be read\)/);
+  });
+
+  it("quoted and backslash text survives redaction intact (parsed values, not serialized JSON)", async () => {
+    const title = `He said "api_key=${KEY}" \\ and \"quoted\" ${KEY}\\`;
+    const body = { totalRecords: 1, opportunitiesData: [{ noticeId: "n1", title }] };
+    const r = await new SamGovClient(KEY, okFetch(body) as any).search({ postedFrom: "2026-01-01", postedTo: "2026-01-02" });
+    expect(r.results[0].title).toBe(title.replace(`api_key=${KEY}`, "api_key=REDACTED").split(KEY).join("REDACTED"));
+    expect(JSON.stringify(r)).not.toContain(KEY);
+    expect(redactDeep({ [KEY]: [1, null, true, `x${KEY}`] }, KEY)).toEqual({ REDACTED: [1, null, true, "xREDACTED"] });
   });
 });
