@@ -9,12 +9,13 @@ An [MCP](https://modelcontextprotocol.io) server that lets AI assistants (Claude
 ## Quickstart
 
 1. Get a free API key: sign in at [sam.gov](https://sam.gov) → Account Details → API Key.
-2. Build from source (npm package coming soon):
+2. Install. Claude Code:
 
    ```bash
-   git clone https://github.com/itcustomsolution/sam-gov-mcp
-   cd sam-gov-mcp && npm install && npm run build
+   claude mcp add sam-gov -e SAM_API_KEY=your-key-here -- npx -y @itcustomsolution/sam-gov-mcp
    ```
+
+   Or run it directly: `SAM_API_KEY=your-key-here npx -y @itcustomsolution/sam-gov-mcp`
 
 3. Add it to your MCP client. Claude Desktop (`claude_desktop_config.json`):
 
@@ -22,8 +23,8 @@ An [MCP](https://modelcontextprotocol.io) server that lets AI assistants (Claude
    {
      "mcpServers": {
        "sam-gov": {
-         "command": "node",
-         "args": ["/absolute/path/to/sam-gov-mcp/dist/index.js"],
+         "command": "npx",
+         "args": ["-y", "@itcustomsolution/sam-gov-mcp"],
          "env": { "SAM_API_KEY": "your-key-here" }
        }
      }

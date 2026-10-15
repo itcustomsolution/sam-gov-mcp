@@ -1,5 +1,5 @@
 {
-  "name": "sam-gov-mcp",
+  "name": "@itcustomsolution/sam-gov-mcp",
   "version": "0.1.0",
   "description": "MCP server for searching SAM.gov contract opportunities (read-only, bring your own free SAM.gov API key)",
   "main": "dist/server.js",
@@ -40,7 +40,7 @@
     "type": "git",
     "url": "git+https://github.com/itcustomsolution/sam-gov-mcp.git"
   },
-  "homepage": "https://github.com/itcustomsolution/sam-gov-mcp#readme",
+  "homepage": "https://felafagbure.com/open-source/",
   "engines": {
     "node": ">=18"
   },

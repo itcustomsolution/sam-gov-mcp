@@ -1,0 +1,29 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.itcustomsolution/sam-gov-mcp",
+  "description": "Search SAM.gov contract opportunities (read-only). Bring your own free SAM.gov API key.",
+  "repository": {
+    "url": "https://github.com/itcustomsolution/sam-gov-mcp",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@itcustomsolution/sam-gov-mcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "SAM_API_KEY",
+          "description": "Your free SAM.gov API key (sam.gov > Account Details > API Key)",
+          "isRequired": true,
+          "isSecret": true,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}
