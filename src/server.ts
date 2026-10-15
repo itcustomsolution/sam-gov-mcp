@@ -18,8 +18,8 @@ export function createServer(opts: { apiKey?: string; fetchImpl?: FetchLike; bas
         keywords: z.string().optional().describe("Words to match in the opportunity title"),
         naics: z.string().optional().describe("NAICS code, e.g. 541512"),
         set_aside: z.string().optional().describe("Set-aside code, e.g. SBA, 8A, SDVOSBC (see list_set_aside_codes)"),
-        posted_from: z.string().describe("Start date, YYYY-MM-DD or MM/DD/YYYY"),
-        posted_to: z.string().describe("End date, YYYY-MM-DD or MM/DD/YYYY"),
+        posted_from: z.string().optional().describe("Start date, YYYY-MM-DD or MM/DD/YYYY (default: 30 days ago)"),
+        posted_to: z.string().optional().describe("End date, YYYY-MM-DD or MM/DD/YYYY (default: today)"),
         state: z.string().optional().describe("Place of performance state, 2-letter code"),
         limit: z.number().int().min(1).max(100).optional().describe("Max results (default 10)"),
         offset: z.number().int().min(0).optional(),
@@ -28,8 +28,8 @@ export function createServer(opts: { apiKey?: string; fetchImpl?: FetchLike; bas
     async (a) => {
       try {
         return text(await client().search({
-          keywords: a.keywords, naics: a.naics, setAside: a.set_aside, postedFrom: a.posted_from,
-          postedTo: a.posted_to, state: a.state, limit: a.limit, offset: a.offset,
+          keywords: a.keywords, naics: a.naics, setAside: a.set_aside, postedFrom: a.posted_from ?? new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10),
+          postedTo: a.posted_to ?? new Date().toISOString().slice(0, 10), state: a.state, limit: a.limit, offset: a.offset,
         }));
       } catch (e) { return fail(e); }
     },
