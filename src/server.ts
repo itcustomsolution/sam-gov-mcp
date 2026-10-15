@@ -6,7 +6,7 @@ const text = (v: unknown) => ({ content: [{ type: "text" as const, text: typeof 
 const fail = (e: unknown, key?: string) => ({ ...text(`Error: ${redactKey(String((e as Error)?.message ?? e), key)}`), isError: true });
 
 export function createServer(opts: { apiKey?: string; fetchImpl?: FetchLike; baseUrl?: string } = {}) {
-  const server = new McpServer({ name: "sam-gov-mcp", version: "0.1.2" });
+  const server = new McpServer({ name: "sam-gov-mcp", version: "0.1.3" });
   const key = () => opts.apiKey ?? process.env.SAM_API_KEY ?? "";
   const client = () => new SamGovClient(key(), opts.fetchImpl, opts.baseUrl);
 
