@@ -3,6 +3,12 @@
  * Docs: https://open.gsa.gov/api/get-opportunities-public-api/
  */
 export const SAM_BASE_URL = "https://api.sam.gov/opportunities/v2/search";
+export const MAX_PAGE_SIZE = 1000; // The MCP tool keeps its existing, smaller 100-record limit.
+export const MAX_PAGE_INDEX = 1_000_000;
+export const MAX_KEYWORDS_LENGTH = 1000;
+export const MAX_NOTICE_ID_LENGTH = 128;
+export const MAX_JSON_DEPTH = 32;
+export const MAX_JSON_NODES = 50_000;
 
 export const SET_ASIDE_CODES: Record<string, string> = {
   SBA: "Total Small Business Set-Aside (FAR 19.5)",
@@ -50,6 +56,19 @@ export interface OpportunitySummary {
   uiLink?: string;
 }
 
+export interface SearchResult {
+  total: number;
+  results: OpportunitySummary[];
+  pagination: {
+    page_index: number;
+    page_size: number;
+    returned_count: number;
+    partial: boolean;
+    has_more: boolean;
+    next_offset: number | null;
+  };
+}
+
 /** Minimal fetch shape. `body` must be a byte stream; the client never calls text()/json(). */
 export type FetchLike = (url: string, init?: { headers?: Record<string, string>; signal?: AbortSignal }) => Promise<{
   ok: boolean;
@@ -58,7 +77,7 @@ export type FetchLike = (url: string, init?: { headers?: Record<string, string>;
 }>;
 
 export class SamGovError extends Error {
-  constructor(message: string, public status?: number) {
+  constructor(message: string, public status?: number, public code = "INVALID_INPUT") {
     super(message);
     this.name = "SamGovError";
   }
@@ -66,6 +85,7 @@ export class SamGovError extends Error {
 
 /** Accepts yyyy-mm-dd or MM/dd/yyyy and returns MM/dd/yyyy (the format SAM.gov requires). */
 export function toSamDate(input: string): string {
+  if (typeof input !== "string" || input.length > 32) throw new SamGovError("Invalid date. Use YYYY-MM-DD or MM/DD/YYYY.");
   const t = input.trim();
   const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(t);
   const us = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(t);
@@ -75,7 +95,7 @@ export function toSamDate(input: string): string {
     // Reject impossible dates like 2026-13-45 instead of silently rolling them over.
     if (dt.getUTCFullYear() === +y && dt.getUTCMonth() === +m - 1 && dt.getUTCDate() === +d) return `${m}/${d}/${y}`;
   }
-  throw new SamGovError(`Invalid date "${input}". Use YYYY-MM-DD or MM/DD/YYYY.`);
+  throw new SamGovError("Invalid date. Use YYYY-MM-DD or MM/DD/YYYY.");
 }
 
 function parseSam(d: string): Date {
@@ -84,29 +104,35 @@ function parseSam(d: string): Date {
 }
 
 export function buildSearchUrl(apiKey: string, p: SearchParams, base = SAM_BASE_URL): string {
+  if (!p || typeof p !== "object") throw new SamGovError("Search parameters are required.");
   const from = toSamDate(p.postedFrom);
   const to = toSamDate(p.postedTo);
   const days = (parseSam(to).getTime() - parseSam(from).getTime()) / 86400000;
   if (days < 0) throw new SamGovError("postedFrom must be on or before postedTo.");
   if (days > 365) throw new SamGovError("SAM.gov allows a posted date range of at most 1 year.");
+  const limit = p.limit ?? 10;
+  const offset = p.offset ?? 0;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_PAGE_SIZE) throw new SamGovError(`limit must be an integer from 1 to ${MAX_PAGE_SIZE}.`);
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > MAX_PAGE_INDEX) throw new SamGovError(`offset must be a zero-based page index from 0 to ${MAX_PAGE_INDEX}.`);
+  if (p.keywords !== undefined && (typeof p.keywords !== "string" || p.keywords.length > MAX_KEYWORDS_LENGTH)) throw new SamGovError(`keywords must be at most ${MAX_KEYWORDS_LENGTH} characters.`);
   const q = new URLSearchParams();
   q.set("api_key", apiKey);
   q.set("postedFrom", from);
   q.set("postedTo", to);
-  q.set("limit", String(Math.min(Math.max(p.limit ?? 10, 1), 1000)));
-  q.set("offset", String(Math.max(p.offset ?? 0, 0)));
+  q.set("limit", String(limit));
+  q.set("offset", String(offset));
   if (p.keywords) q.set("title", p.keywords);
   if (p.naics) {
-    if (!/^\d{2,6}$/.test(p.naics)) throw new SamGovError("naics must be 2-6 digits.");
+    if (typeof p.naics !== "string" || !/^\d{2,6}$/.test(p.naics)) throw new SamGovError("naics must be 2-6 digits.");
     q.set("ncode", p.naics);
   }
   if (p.setAside) {
-    if (!Object.prototype.hasOwnProperty.call(SET_ASIDE_CODES, p.setAside))
-      throw new SamGovError(`Unknown set-aside code "${p.setAside}". Call list_set_aside_codes.`);
+    if (typeof p.setAside !== "string" || !Object.prototype.hasOwnProperty.call(SET_ASIDE_CODES, p.setAside))
+      throw new SamGovError("Unknown set-aside code. Call list_set_aside_codes.");
     q.set("typeOfSetAside", p.setAside);
   }
   if (p.state) {
-    if (!/^[A-Za-z]{2}$/.test(p.state)) throw new SamGovError("state must be a 2-letter code.");
+    if (typeof p.state !== "string" || !/^[A-Za-z]{2}$/.test(p.state)) throw new SamGovError("state must be a 2-letter code.");
     q.set("state", p.state.toUpperCase());
   }
   return `${base}?${q.toString()}`;
@@ -132,7 +158,7 @@ export function summarize(o: any): OpportunitySummary {
 export function redactKey(s: string, key?: string): string {
   let out = s.replace(/api_key=[^&\s"']+/gi, "api_key=REDACTED");
   // Also remove the literal key wherever an upstream error might echo it.
-  if (key && key.length >= 8) out = out.split(key).join("REDACTED");
+  if (key) out = out.split(key).join("REDACTED");
   return out;
 }
 
@@ -143,14 +169,50 @@ export const MAX_ERROR_BODY_BYTES = 16 * 1024;
 
 /** Recursively redact every string (keys and values) in a parsed JSON value. */
 export function redactDeep<T>(value: T, key?: string): T {
-  if (typeof value === "string") return redactKey(value, key) as unknown as T;
-  if (Array.isArray(value)) return value.map((v) => redactDeep(v, key)) as unknown as T;
-  if (value && typeof value === "object") {
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[redactKey(k, key)] = redactDeep(v, key);
-    return out as T;
+  let nodes = 0;
+  const visit = (v: unknown, depth: number): unknown => {
+    if (++nodes > MAX_JSON_NODES || depth > MAX_JSON_DEPTH) throw new SamGovError("SAM.gov response exceeds JSON structure limits; narrow the search.", undefined, "INVALID_RESPONSE");
+    if (typeof v === "string") return redactKey(v, key);
+    if (Array.isArray(v)) return v.map((item) => visit(item, depth + 1));
+    if (v && typeof v === "object") {
+      const out: Record<string, unknown> = {};
+      for (const [k, item] of Object.entries(v)) {
+        // Define rather than assign so an upstream __proto__ key remains data.
+        Object.defineProperty(out, redactKey(k, key), { value: visit(item, depth + 1), enumerable: true, configurable: true, writable: true });
+      }
+      return out;
+    }
+    return v;
+  };
+  return visit(value, 0) as T;
+}
+
+type Opportunity = Record<string, unknown> & { noticeId: string; title: string };
+const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
+const validNoticeId = (value: unknown): value is string => typeof value === "string" && value.length <= MAX_NOTICE_ID_LENGTH && /^[A-Za-z0-9-]+$/.test(value);
+
+/** Validate the upstream contract without echoing any untrusted field or error envelope. */
+function parseOpportunities(data: unknown, limit: number, offset: number): { total: number; list: Opportunity[] } {
+  const invalid = () => new SamGovError("SAM.gov returned an invalid opportunities response; no results can be trusted.", undefined, "INVALID_RESPONSE");
+  if (!record(data) || !Number.isSafeInteger(data.totalRecords) || (data.totalRecords as number) < 0 || !Array.isArray(data.opportunitiesData)) throw invalid();
+  if (Object.keys(data).some((k) => /^(error|errors|errorMessage)$/i.test(k))) throw invalid();
+  const total = data.totalRecords as number;
+  const list = data.opportunitiesData;
+  if (list.length > limit || total < list.length || (list.length > 0 && offset * limit + list.length > total)) throw invalid();
+  if (data.offset !== undefined && data.offset !== offset) throw invalid();
+  if (data.limit !== undefined && data.limit !== limit) throw invalid();
+  for (const o of list) {
+    if (!record(o) || !validNoticeId(o.noticeId) || typeof o.title !== "string" || o.title.length > 8192) throw invalid();
+    for (const field of ["solicitationNumber", "fullParentPathName", "postedDate", "responseDeadLine", "type", "typeOfSetAside", "naicsCode", "uiLink"]) {
+      if (o[field] !== undefined && o[field] !== null && (typeof o[field] !== "string" || o[field].length > 8192)) throw invalid();
+    }
+    if (o.placeOfPerformance !== undefined && o.placeOfPerformance !== null) {
+      if (!record(o.placeOfPerformance)) throw invalid();
+      const state = o.placeOfPerformance.state;
+      if (state !== undefined && state !== null && (!record(state) || (state.code !== undefined && state.code !== null && typeof state.code !== "string"))) throw invalid();
+    }
   }
-  return value;
+  return { total, list: list as Opportunity[] };
 }
 
 export class ResponseTooLarge extends Error {}
