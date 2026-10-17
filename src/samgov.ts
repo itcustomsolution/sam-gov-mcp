@@ -182,12 +182,19 @@ export function summarize(o: any): OpportunitySummary {
   };
 }
 
+/** Hangul fillers render as nothing but are letters, so the letter exclusion in keyPattern would keep them. */
+const INVISIBLE_LETTERS = ["\u115f", "\u1160", "\u3164", "\uffa0"];
+
 /**
  * Matches the key however an upstream might echo it: each character literal, percent-encoded (either hex
- * case, any number of times), form-encoded or JSON \u-escaped, with any number of whitespace, control or format
- * characters between characters (a wrapped or NUL-split key). Case-insensitive, so a case variant of the key
- * is also removed. Not covered: other encodings such as HTML entities or base64. The separator class cannot
- * match a key character or the start of an encoded one, so matching stays linear in the text length.
+ * case, any number of times), form-encoded or JSON \u-escaped, with any number of separators between characters.
+ * A separator is any character that is not a letter or digit (whitespace, punctuation, control, format, combining
+ * and other invisible characters), or a Hangul filler, except the characters that can begin a key character in
+ * one of those forms: the key's own characters, "%", "\\" and, for a key containing a space, "+". Case-insensitive,
+ * so a case variant of the key is also removed. Not covered: a separator inside an encoded character or itself
+ * encoded, letters or digits used as separators, look-alike characters, a key split across separate strings, and
+ * other encodings such as HTML entities or base64. The separator set is disjoint from every key element by
+ * construction, so matching stays linear in the text length.
  */
 function keyPattern(key: string): RegExp | undefined {
   // ponytail: keys shorter than 8 characters are not plausible SAM keys; redacting them as substrings would
@@ -201,7 +208,11 @@ function keyPattern(key: string): RegExp | undefined {
     if (c === '"' || c === "\\" || c === "/") alts.push(`\\\\${alts[0]}`); // JSON short escapes
     return `(?:${alts.join("|")})`;
   };
-  return new RegExp([...key].map(char).join("[\\s\\p{Cc}\\p{Cf}]*"), "giu");
+  const chars = new Set(key);
+  const own = [...chars].filter((c) => !/[\p{L}\p{N}]/u.test(c)).map((c) => c.replace(/[\]\\^-]/g, "\\$&")).join("");
+  const fillers = INVISIBLE_LETTERS.filter((c) => !chars.has(c)).join("");
+  const sep = `(?:[^\\p{L}\\p{N}%\\\\${chars.has(" ") ? "+" : ""}${own}]${fillers ? `|[${fillers}]` : ""})*`;
+  return new RegExp([...key].map(char).join(sep), "giu");
 }
 
 function redactor(key?: string): (s: string) => string {

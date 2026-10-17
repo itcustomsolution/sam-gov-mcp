@@ -23,7 +23,7 @@ export function createServer(opts: { apiKey?: string; fetchImpl?: FetchLike; bas
     "search_opportunities",
     {
       title: "Search SAM.gov opportunities",
-      description: `Search SAM.gov contract opportunities. Read-only. Returns ONE page: check pagination.has_more and pass pagination.next_offset as offset for the next page; a page is not the complete result set unless pagination.partial is false. ${UNTRUSTED} Posted date range is required (max 1 year).`,
+      description: `Search SAM.gov contract opportunities. Read-only. Returns ONE page: check pagination.has_more and pass pagination.next_offset as offset for the next page (next_offset is null with pagination.page_limit_reached true at the 1,000,000 page-index limit: narrow the search); a page is not the complete result set unless pagination.partial is false. ${UNTRUSTED} Posted date range is required (max 1 year).`,
       inputSchema: {
         keywords: z.string().max(MAX_KEYWORDS_LENGTH).optional().describe("Words to match in the opportunity title"),
         naics: z.string().max(6).optional().describe("NAICS code, e.g. 541512"),

@@ -334,7 +334,8 @@ describe("independent review round (2026-10-16): residual envelope, redaction an
 
 describe("independent re-audit (2026-10-17): redaction boundary, cleanup deadline, page-index limit", () => {
   const SENTINEL = "SYNTHETIC-SAM-SENTINEL-0123456789";
-  const recoverable = (text: string) => text.replace(/[\s\p{Cc}\p{Cf}]|\\u200b|\\u0000/gu, "").includes(SENTINEL);
+  // An agent that strips everything but the key's own characters must not get the key back.
+  const recoverable = (text: string) => text.replace(/\\u200b|\\u0000/gu, "").replace(/[^A-Za-z0-9-]/g, "").includes(SENTINEL);
 
   it("SAM-REA-01: a key split by any number of invisible, control or whitespace characters is removed", async () => {
     for (const n of [1, 16, 17, 64, 4096]) {
@@ -351,6 +352,32 @@ describe("independent re-audit (2026-10-17): redaction boundary, cleanup deadlin
     const { call } = await mcp(reply(200, envelope([opp("a1", { title: SENTINEL.slice(0, 5) + "\u200b".repeat(17) + SENTINEL.slice(5) })])), SENTINEL);
     const out = await call("search_opportunities", { posted_from: "2026-01-01", posted_to: "2026-01-31" });
     expect(recoverable(JSON.stringify(out.body))).toBe(false);
+  });
+
+  it("OM-R2-SAM-01: combining marks, variation selectors, fillers, braille blank and punctuation are separators too", async () => {
+    const seps = ["\u0301", "\u034f", "\ufe00", "\ufe0f", "\u{e0100}", "\u115f", "\u1160", "\u3164", "\uffa0", "\u2800", "\u{1d159}", "\u17b4", ".", "*", "\u00b7", "\u3000"];
+    for (const sep of seps) {
+      for (const split of [SENTINEL.slice(0, 10) + sep + SENTINEL.slice(10), [...SENTINEL].join(sep)]) {
+        const ok = await new SamGovClient(SENTINEL, reply(200, envelope([opp("a1", { title: split })])) as any).search(range)
+          .then((v) => JSON.stringify(v), (e) => `${e.code}: ${e.message}`);
+        expect(recoverable(ok), `success ${JSON.stringify(sep)}`).toBe(false);
+        const err: any = await new SamGovClient(SENTINEL, reply(502, `echo ${split}`) as any).search(range).catch((e) => e);
+        expect(recoverable(err.message), `error ${JSON.stringify(sep)}`).toBe(false);
+      }
+    }
+    // Letters between the key's characters are text, not a disguised key, and are left alone.
+    const interleaved = [...SENTINEL].join("x");
+    expect(redactKey(interleaved, SENTINEL)).toBe(interleaved);
+  });
+
+  it("OM-R2-SAM-02: a key containing a space or punctuation does not make matching slow", async () => {
+    for (const key of [" " + SENTINEL, "ABCD EFGH IJKL", "ABCD-EFGH.IJKL"]) {
+      const text = (key[0] + " ".repeat(8000)).repeat(60); // about 480,000 characters
+      const started = Date.now();
+      redactKey(text, key);
+      expect(Date.now() - started, JSON.stringify(key)).toBeLessThan(2000);
+      expect(redactKey(`x${key}x`, key)).toBe("xREDACTEDx");
+    }
   });
 
   it("SAM-REA-01: matching stays fast on long runs of separator characters", async () => {
