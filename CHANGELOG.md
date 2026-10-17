@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.2.0-rc.2] - unreleased candidate (2026-10-17, not published; 0.2.0-rc.1 of 2026-10-16 was the independently audited candidate)
+## [0.2.0-rc.3] - unreleased candidate (2026-10-17, not published; 0.2.0-rc.1 of 2026-10-16 and 0.2.0-rc.2 of 2026-10-17 were the independently audited candidates)
 
 **Breaking:** malformed or mismatched SAM.gov responses are now tool errors; search results gain `pagination` and
 `source`; `get_opportunity` returns `{source, notice}`; tool errors are JSON objects with a `code`; Node 22 or later
@@ -39,3 +39,9 @@ is required; the exported `buildSearchUrl` rejects out-of-range `limit`/`offset`
   deadline, so a stalled transport cannot hold a result past the timeout (SAM-REA-02); at the page-index limit
   `has_more` stays true and the new `pagination.page_limit_reached` explains the missing `next_offset` (SAM-REA-03);
   an HTTP error whose body times out says so. `readCapped` takes an optional `AbortSignal`.
+- r2 audit fixes (2026-10-17): the request deadline also holds against a custom `fetchImpl` that ignores the abort
+  signal; a late reply is `TIMEOUT` and its body is released unread (R2-SAM-01); a key that looks like the redaction
+  marker is refused (R2-SAM-02). Before release (pre-existing): after pattern redaction, any string whose decoded
+  letters and digits contain the key's is replaced whole, and a key split across neighbouring fields refuses the
+  response, so `%`, `\`, the key's own punctuation, encoded separators, fullwidth letters and HTML entities no longer
+  leave the key recoverable. `lettersAndDigits` and `markerLike` are exported.
