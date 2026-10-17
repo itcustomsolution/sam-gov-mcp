@@ -229,76 +229,147 @@ const UTF8 = new TextDecoder("utf-8");
 
 export const MAX_DECODE_ROUNDS = 8;
 
-/** Characters an upstream might insert, even inside an escape: anything but letters, digits and the characters
- * escapes are written with ("%", "\\", "&", "#", ";"), plus Hangul fillers. */
-const INSERTED = new RegExp(`[^\\p{L}\\p{N}%\\\\&#;]|[${INVISIBLE_LETTERS}]`, "gu");
+/**
+ * One decoding step of each escape an upstream might write a key character in: a run of percent-encoded bytes (a
+ * repeated encoding of "%" collapses), a JSON \u escape, an HTML numeric entity read whole however many leading zeros
+ * it has, and a named HTML entity (dropped). Groups 1 and 2 are a numeric entity's hex and decimal digits.
+ */
+const ESCAPE = /(?:%(?:25)*[0-9a-f]{2})+|\\u[0-9a-f]{4}|&#(?:x0*([0-9a-f]+)|0*(\d+));?|&[a-z][a-z0-9]{1,31};/gi;
+/** Characters an upstream might insert, even inside an escape: after NFKC, anything but an ASCII letter or digit and
+ * the characters escapes are written with ("%", "\\", "&", "#", ";"). */
+const INSERTED = /[^A-Za-z0-9%\\&#;]/g;
+const OUT_OF_RANGE = Symbol("numeric entity beyond U+10FFFF");
+
+function decodeEscape(tok: string, hex?: string, dec?: string): string | typeof OUT_OF_RANGE {
+  if (tok[0] === "%") return UTF8.decode(Uint8Array.from(tok.slice(1).split("%"), (e) => parseInt(e.slice(-2), 16)));
+  if (tok[0] === "\\") return String.fromCharCode(parseInt(tok.slice(2), 16));
+  // Named entities are dropped, except the double-struck, script and fraktur letters ("&Sopf;"), which NFKC folds to a
+  // plain letter once decoded.
+  if (tok[1] !== "#") return /^&[a-z](?:opf|scr|fr);$/i.test(tok) ? tok[1] : "";
+  // The whole digit run: a bounded run would decode a prefix of "&#00000083;" and leave digits that hide a letter.
+  const cp = hex !== undefined ? (hex.length > 6 ? Infinity : parseInt(hex, 16)) : (dec!.length > 7 ? Infinity : Number(dec));
+  return cp > 0x10ffff ? OUT_OF_RANGE : String.fromCodePoint(cp);
+}
+
+/** Decodes every escape in `t` once and applies NFKC; undefined when `t` holds a numeric entity beyond U+10FFFF. */
+function decodeOnce(t: string, dropOutOfRange = false): string | undefined {
+  let bad = false;
+  const out = t.replace(ESCAPE, (tok: string, h?: string, d?: string) => {
+    const r = decodeEscape(tok, h, d);
+    if (r !== OUT_OF_RANGE) return r;
+    bad = true;
+    return "";
+  }).normalize("NFKC");
+  return bad && !dropOutOfRange ? undefined : out;
+}
+
 const fold = (t: string) => t.normalize("NFKC").toLowerCase().replace(/[^a-z0-9]/g, "");
 
 /**
- * The letters and digits of `s`, case-folded, in three views a key could be read from: as written (so "%" used as
- * a separator before two hex digits cannot hide the key's own characters by decoding them); decoded; and decoded
- * with inserted characters removed first, round after round (so an invisible character inside an escape cannot stop
- * it decoding). Decoding undoes percent-encoding (repeated encoding of "%" collapsed), JSON \u escapes and HTML
- * numeric entities, read whole however many leading zeros they carry, until nothing changes; named HTML entities are
- * dropped, and NFKC folds compatibility forms such as fullwidth letters. Undefined when a view still decodes further
- * after MAX_DECODE_ROUNDS rounds, or holds a numeric entity beyond U+10FFFF: the redactor treats either as possibly
- * the key. Linear in `s`.
+ * The letters and digits of `s`, case-folded, after decoding every escape round after round until nothing changes.
+ * Undefined when it still decodes after MAX_DECODE_ROUNDS rounds or holds a numeric entity beyond U+10FFFF. Kept for
+ * callers of r3; the redactor uses keyScanner, which also reads mixed and partly decoded forms.
  */
-export function keyViews(s: string): [string, string, string] | undefined {
-  const decoded = (strip: boolean): string | undefined => {
-    let t = strip ? s.replace(INSERTED, "") : s;
-    for (let round = 0; ; round++) {
-      let next = decodeOnce(t);
-      if (next === undefined) return undefined;
-      if (strip) next = next.replace(INSERTED, "");
-      if (next === t) return fold(t);
-      if (round === MAX_DECODE_ROUNDS) return undefined;
-      t = next;
-    }
-  };
-  const a = decoded(false), b = decoded(true);
-  return a === undefined || b === undefined ? undefined : [fold(s), a, b];
-}
-
-/** The decoded view of keyViews (kept for callers of r3). */
 export function lettersAndDigits(s: string): string | undefined {
-  return keyViews(s)?.[1];
+  let t = s.normalize("NFKC");
+  for (let round = 0; ; round++) {
+    const next = decodeOnce(t);
+    if (next === undefined) return undefined;
+    if (next === t) return fold(t);
+    if (round === MAX_DECODE_ROUNDS) return undefined;
+    t = next;
+  }
 }
 
-function decodeOnce(t: string): string | undefined {
-  let outOfRange = false;
-  const out = t.replace(/%(?:25)+(?=[0-9a-f]{2})/gi, "%")
-      .replace(/(?:%[0-9a-f]{2})+/gi, (run) => UTF8.decode(Uint8Array.from(run.slice(1).split("%"), (h) => parseInt(h, 16))))
-      .replace(/\\u([0-9a-f]{4})/gi, (_m, h) => String.fromCharCode(parseInt(h, 16)))
-      // The whole digit run: a bounded run would decode a prefix of "&#00000083;" and leave digits that hide a letter.
-      .replace(/&#(?:x0*([0-9a-f]+)|0*(\d+));?/gi, (_m, h, d) => {
-        const cp = h ? (h.length > 6 ? Infinity : parseInt(h, 16)) : (d.length > 7 ? Infinity : Number(d));
-        if (cp > 0x10ffff) { outOfRange = true; return ""; }
-        return String.fromCodePoint(cp);
-      })
-      .replace(/&[a-z][a-z0-9]{1,31};/gi, "");
-  return outOfRange ? undefined : out;
+type Scan = { hit: boolean; end: Uint32Array };
+type Scanner = (s: string, start?: Uint32Array) => Scan;
+
+/**
+ * Finds the key's letters and digits (`core`) in a string under any reading of it in which each escape is taken
+ * either as written or decoded one step, independently of every other escape, after NFKC, round after round until
+ * nothing changes; and the same again with inserted characters removed before each round. A shift-and automaton over
+ * `core` follows both readings of every escape at once, so the work stays linear in the string. `start` is a partial
+ * match carried from the strings before this one (a key split across neighbouring fields), and `end` is the partial
+ * match left at its end. Also a hit when a reading still decodes after MAX_DECODE_ROUNDS rounds, or when the string
+ * holds a numeric entity beyond U+10FFFF other than one joined up from inserted characters.
+ */
+function keyScanner(core: string): Scanner {
+  const words = Math.ceil(core.length / 32), top = core.length - 1;
+  const masks = new Map<number, Uint32Array>();
+  [...core].forEach((c, i) => {
+    const m = masks.get(c.charCodeAt(0)) ?? new Uint32Array(words);
+    m[i >>> 5] |= 1 << (i & 31);
+    masks.set(c.charCodeAt(0), m);
+  });
+  const none = new Uint32Array(words);
+  // Feeds the letters and digits of `text` into the state `d`, in place; true once the whole key has been read.
+  const feed = (d: Uint32Array, text: string): boolean => {
+    let hit = false;
+    const t = text.normalize("NFKC").toLowerCase();
+    for (let k = 0; k < t.length; k++) {
+      const c = t.charCodeAt(k);
+      if (!((c >= 48 && c <= 57) || (c >= 97 && c <= 122))) continue; // not a letter or digit: dropped, as a separator
+      const m = masks.get(c) ?? none;
+      let carry = 1;
+      for (let w = 0; w < words; w++) { const v = d[w]; d[w] = ((v << 1) | carry) & m[w]; carry = v >>> 31; }
+      if ((d[top >>> 5] >>> (top & 31)) & 1) hit = true;
+    }
+    return hit;
+  };
+  const scanRound = (t: string, start: Uint32Array, end: Uint32Array): boolean => {
+    const d = start.slice(), alt = new Uint32Array(words);
+    let hit = false, last = 0;
+    for (const m of t.matchAll(ESCAPE)) {
+      hit = feed(d, t.slice(last, m.index)) || hit;
+      const decoded = decodeEscape(m[0], m[1], m[2]);
+      if (decoded !== OUT_OF_RANGE) { alt.set(d); hit = feed(alt, decoded) || hit; }
+      hit = feed(d, m[0]) || hit;
+      if (decoded !== OUT_OF_RANGE) for (let w = 0; w < words; w++) d[w] |= alt[w];
+      last = m.index! + m[0].length;
+    }
+    hit = feed(d, t.slice(last)) || hit;
+    for (let w = 0; w < words; w++) end[w] |= d[w];
+    return hit;
+  };
+  return (s, start = none) => {
+    const end = new Uint32Array(words);
+    let hit = false;
+    for (const strip of [false, true]) {
+      // With inserted characters removed, an out-of-range entity may be joined up from ordinary text ("Fax & #: 202..."),
+      // so it is dropped there rather than treated as possibly the key.
+      let t = strip ? s.normalize("NFKC").replace(INSERTED, "") : s.normalize("NFKC");
+      for (let round = 0; ; round++) {
+        hit = scanRound(t, start, end) || hit;
+        let next = decodeOnce(t, strip);
+        if (next === undefined) return { hit: true, end };
+        if (strip) next = next.replace(INSERTED, "");
+        if (next === t) break;
+        if (round === MAX_DECODE_ROUNDS) return { hit: true, end };
+        t = next;
+      }
+    }
+    return { hit, end };
+  };
 }
 
 /**
- * Pattern redaction first (it keeps the rest of the text); then, fail-closed, any string in any of whose keyViews
- * the key's letters and digits still appear is replaced whole. `seen` receives the three views of every result.
+ * Pattern redaction first (it keeps the rest of the text); then, fail-closed, any string in which keyScanner finds the
+ * key is replaced whole. `after` receives each result, the scanner and the partial match left at its end.
  */
-function redactor(key?: string, seen?: (views: readonly string[]) => void): (s: string) => string {
+function redactor(key?: string, after?: (out: string, scan: Scanner, end: Uint32Array) => void): (s: string) => string {
   const pattern = key ? keyPattern(key) : undefined;
   const core = keyCore(key);
+  const scan = core ? keyScanner(core) : undefined;
   return (s) => {
     // The whole key first, so a parameter pattern cannot redact only its head.
     const out = (pattern ? s.replace(pattern, "REDACTED") : s)
       .replace(/api_key=[^&\s"']+/gi, "api_key=REDACTED").replace(/api_key%3D(?:[^&%\s"']|%(?!26)[0-9a-f]{2})+/gi, "api_key%3DREDACTED");
-    if (!core) return out;
-    const views = keyViews(out);
-    if (views === undefined || views.some((v) => v.includes(core))) {
-      seen?.(["redacted", "redacted", "redacted"]);
-      return "REDACTED";
-    }
-    seen?.(views);
-    return out;
+    if (!scan) return out;
+    let r = scan(out);
+    const result = r.hit ? "REDACTED" : out;
+    if (r.hit) r = scan(result);
+    after?.(result, scan, r.end);
+    return result;
   };
 }
 
@@ -323,15 +394,18 @@ export const MAX_ERROR_BODY_BYTES = 16 * 1024;
 
 /** Recursively redact every string (keys and values) in a parsed JSON value, within structure limits. */
 export function redactDeep<T>(value: T, key?: string): T {
-  // Each of the three keyViews of every output string in output order, and separately of the values and of the
-  // property names: a key split across neighbouring fields (value and value, name and value, nested names) shows up
-  // only when they are read together.
-  const all = ["", "", ""];
-  const values = ["", "", ""];
-  const names = ["", "", ""];
-  const add = (into: string[], views: readonly string[]) => views.forEach((v, i) => { into[i] += v; all[i] += v; });
-  const redact = redactor(key, (views) => add(values, views));
-  const redactName = redactor(key, (views) => add(names, views));
+  // A partial match of the key carried through every output string in output order, and separately through the
+  // values and through the property names: a key split across neighbouring fields (value and value, name and value,
+  // nested names) shows up only when they are read together.
+  let all: Uint32Array | undefined, values: Uint32Array | undefined, names: Uint32Array | undefined;
+  const follow = (state: Uint32Array | undefined, out: string, scan: Scanner, end: Uint32Array) => {
+    if (!state || state.every((w) => w === 0)) return end;
+    const r = scan(out, state);
+    if (r.hit) throw new SamGovError("SAM.gov response appears to contain the API key split across fields; it was refused and none of it is returned.", undefined, "INVALID_RESPONSE");
+    return r.end;
+  };
+  const redact = redactor(key, (out, scan, end) => { all = follow(all, out, scan, end); values = follow(values, out, scan, end); });
+  const redactName = redactor(key, (out, scan, end) => { all = follow(all, out, scan, end); names = follow(names, out, scan, end); });
   let nodes = 0;
   const visit = (v: unknown, depth: number): unknown => {
     if (++nodes > MAX_JSON_NODES || depth > MAX_JSON_DEPTH) throw new SamGovError("SAM.gov response exceeds JSON structure limits; narrow the search.", undefined, "INVALID_RESPONSE");
@@ -357,11 +431,7 @@ export function redactDeep<T>(value: T, key?: string): T {
     }
     return v;
   };
-  const out = visit(value, 0) as T;
-  const core = keyCore(key);
-  if (core && [all, values, names].some((joined) => joined.some((v) => v.includes(core))))
-    throw new SamGovError("SAM.gov response appears to contain the API key split across fields; it was refused and none of it is returned.", undefined, "INVALID_RESPONSE");
-  return out;
+  return visit(value, 0) as T;
 }
 
 type Opportunity = Record<string, unknown> & { noticeId: string };
@@ -472,7 +542,9 @@ export async function readCapped(body: ReadableStream<Uint8Array> | null, max: n
 
 /** Upstream or network error text is untrusted: redacted, then control/format/separator characters removed, truncated, labelled. */
 function excerpt(text: string, redact: (s: string) => string): string {
-  return `[untrusted upstream text] ${redact(text).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, " ").slice(0, 300)}`;
+  // Redact the whole text, cut it, then redact the cut again: cutting can turn an escape after the key into one of its
+  // characters ("...012345678&#577" cut to "...012345678&#57").
+  return `[untrusted upstream text] ${redact(redact(text).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, " ").slice(0, 300))}`;
 }
 
 const isTimeout = (e: unknown) => ["TimeoutError", "AbortError"].includes((e as Error)?.name);

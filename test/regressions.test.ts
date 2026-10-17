@@ -692,3 +692,76 @@ describe("r3 audit (2026-10-17): decoded redaction false negatives, short-key po
     expect(readme).toContain("keys shorter than 8 characters get only the `api_key=` value removed");
   });
 });
+
+describe("r4 review (omar, 2026-10-17): mixed readings, excerpt cut, per-round NFKC", () => {
+  const SENTINEL = "SYNTHETIC-SAM-SENTINEL-0123456789";
+  const K = SENTINEL, R = K.slice(1);
+  const CORE = K.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const project = (s: string) => s.normalize("NFKC").toLowerCase().replace(/[^a-z0-9]/g, "");
+  // A stronger reader than the auditor's: NFKC first, entities with or without ";", and every subset of escapes
+  // decoded (each escape kept as written or decoded once), the way a lenient consumer might.
+  const recoverable = (s: string) => {
+    let t = s.normalize("NFKC").replace(/[\p{Cf}\p{Cc}]/gu, "");
+    const esc = /%[0-9a-f]{2}|\\u[0-9a-f]{4}|&#(?:x[0-9a-f]+|\d+);?/gi;
+    for (let round = 0; round < 4; round++) {
+      const parts = t.split(esc), toks = t.match(esc) ?? [];
+      if (toks.length <= 12) {
+        for (let mask = 0; mask < 1 << toks.length; mask++) {
+          const read = parts.map((p, i) => p + (i < toks.length ? ((mask >> i) & 1 ? dec(toks[i]) : toks[i]) : "")).join("");
+          if (project(read).includes(CORE)) return true;
+        }
+      }
+      if (project(t).includes(CORE)) return true;
+      t = t.replace(esc, dec).normalize("NFKC");
+    }
+    return project(t).includes(CORE);
+  };
+  const dec = (e: string) => e[0] === "%" ? String.fromCharCode(parseInt(e.slice(1), 16))
+    : e[0] === "\\" ? String.fromCharCode(parseInt(e.slice(2), 16))
+    : String.fromCodePoint(Math.min(0x10ffff, /x/i.test(e) ? parseInt(e.replace(/[^0-9a-f]/gi, "").slice(0), 16) : parseInt(e.replace(/\D/g, ""), 10)));
+  const outcome = (p: Promise<unknown>) => p.then((v) => JSON.stringify(v), (e) => `${e.code}: ${e.message}`);
+  const mixed = ["%53", "&#83;", "\\u0053"].map((first) => first + R.replace("6789", "%6789"));
+
+  it("OM-R4-SAM-01: a string mixing a decoded form and a raw escape used as a separator is not returned", async () => {
+    for (const value of mixed) {
+      expect(recoverable(value), "the fixture is a real disguise of the key").toBe(true);
+      const full = await outcome(new SamGovClient(K, reply(200, envelope([opp("n1", { title: value, [value]: "synthetic property" })])) as any).getOpportunity("n1"));
+      expect(recoverable(full), `notice ${value}`).toBe(false);
+      const err: any = await new SamGovClient(K, reply(502, `echo ${value}`) as any).search(range).catch((e) => e);
+      expect(recoverable(err.message), `error ${value}`).toBe(false);
+      expect(redactKey(value, K)).toBe("REDACTED");
+    }
+    const split = await outcome(new SamGovClient(K, reply(200, envelope([opp("a1", { title: "%53YNTHETIC-SAM", solicitationNumber: "-SENTINEL-012345%6789" })])) as any).search(range));
+    expect(split.startsWith("INVALID_RESPONSE"), split).toBe(true);
+  });
+
+  it("OM-R4-SAM-02: cutting an error excerpt cannot complete the key", async () => {
+    for (const tail of ["&#577 tail", "&#x39a tail"]) {
+      const body = "echo " + "x".repeat(259) + K.slice(0, -1) + tail;
+      const err: any = await new SamGovClient(K, reply(502, body) as any).search(range).catch((e) => e);
+      expect(err?.code).toBeTruthy();
+      expect(recoverable(err.message), tail).toBe(false);
+    }
+  });
+
+  it("OM-R4-SAM-03: compatibility forms of escape characters and a non-ASCII letter inside an escape are read", () => {
+    for (const value of ["％53" + R, "%５３" + R, "＆＃83;" + R, "＼u0053" + R, "%é53" + R, "&Sopf;" + R, "&Sscr;" + R]) {
+      expect(recoverable(value) || /é|&S/.test(value), value).toBe(true);
+      expect(redactKey(value, K), value).toBe("REDACTED");
+    }
+  });
+
+  it("OM-R4-SAM-04: ordinary text that only looks like an entity once spaces are removed is left alone", () => {
+    for (const text of ["Lots 1 & #2-3456789 remain open", "Fax & #: 202-555-0123", "Units 5 & #99999999 are closed", "A &amp; B &Sopf;&Aopf; set"])
+      expect(redactKey(text, K), text).toBe(text);
+    expect(redactKey("see &#99999999; here", K)).toBe("REDACTED"); // written as an entity: still fails closed
+  });
+
+  it("OM-R4-SAM controls: the two-reading scan stays linear on long escape runs", () => {
+    for (const text of [("%41" + "x").repeat(150000), ("&#65;" + "-").repeat(100000), ("\\u0041 ").repeat(80000), "%".repeat(300000) + "53"]) {
+      const started = Date.now();
+      expect(redactKey(text, K)).toBe(text);
+      expect(Date.now() - started, text.slice(0, 12)).toBeLessThan(3000);
+    }
+  });
+});
