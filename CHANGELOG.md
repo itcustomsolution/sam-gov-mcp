@@ -64,4 +64,10 @@ is required; the exported `buildSearchUrl` rejects out-of-range `limit`/`offset`
   what is still not recognized.
 - r4 audit fix (2026-10-17): an escape that one string leaves open and the next completes ("%5" then "3...") is read
   across the boundary, so a key split that way across neighbouring fields refuses the response (R4-SAM-1). README
-  states that the recognized transformations are not protection against every encoding.
+  states that the recognized transformations are not protection against every encoding. After the internal r5 review
+  (OM-R5-SAM-01..04) the boundary is no longer found by matching an open escape in the raw text: all strings in order,
+  the values alone and the property names alone are each read again joined end to end, once, after redaction, so an
+  escape that decodes to an opener ("%25", "&amp;"), a fullwidth opener and an opener with a character inserted are
+  read across the boundary however long the padding, the crafted responses that made r5 slow cost what they did on r4,
+  and a numeric entity beyond U+10FFFF formed only by the joining is dropped there instead of refusing the response.
+  The carried state of r4 stays, for keys whose parts are encoded to different depths.

@@ -841,3 +841,59 @@ describe("r4 audit (2026-10-17): an escape split across neighbouring fields (R4-
     expect(Date.now() - started).toBeLessThan(5000);
   });
 });
+
+describe("r5 review (2026-10-17): split escapes the open-escape pattern did not see, and its cost (OM-R5-SAM-01..04)", () => {
+  const K = "SYNTHETIC-SAM-SENTINEL-0123456789", R = K.slice(1);
+  const outcome = (p: Promise<unknown>) => p.then((v) => JSON.stringify(v), (e) => `${e.code}: ${e.message}`);
+  const refused = (s: string) => s.startsWith("INVALID_RESPONSE");
+  const get = (record: Record<string, unknown>) => outcome(new SamGovClient(K, reply(200, envelope([record])) as any).getOpportunity("n1"));
+  // The reviewer's shapes (review/r5-omar/out/sib-r5.txt): the first field ends in a complete escape that decodes to an
+  // opener, in a fullwidth opener, or in an opener with a character inserted; joined, each decodes to the key.
+  const shapes: [string, string][] = [
+    ["%25", "53"], ["%2525", "53"], ["&amp;", "#83;"], ["&percnt;", "53"], ["&#37;", "53"], ["\\u0025", "53"],
+    ["%5C", "u0053"], ["&bsol;", "u0053"], ["&#38;", "#83;"], ["%26", "#83;"], ["%26%23", "83;"], ["&amp;#", "83;"],
+    ["&amp;#8", "3;"], ["％", "53"], ["％5", "3"], ["＼u00", "53"], ["＆#8", "3;"], ["&＃8", "3;"], ["%５", "3"],
+    ["%​", "53"], ["%​5", "3"], ["%5​", "3"], ["&#​", "83;"], ["\\u00 ", "53"], ["%5 ", "3"],
+  ];
+
+  it("OM-R5-SAM-01: a field ending in an escape that decodes to an opener, or in a fullwidth or broken-up opener, refuses", async () => {
+    for (const [a, b] of shapes) {
+      const r = await get(opp("n1", { a, b: b + R }));
+      expect(refused(r), `${JSON.stringify(a)} | ${JSON.stringify(b)}: ${r}`).toBe(true);
+    }
+  });
+
+  it("OM-R5-SAM-04: a zero-padded entity split across fields refuses however long the padding is", async () => {
+    for (const n of [4095, 5000, 20000]) {
+      const r = await get(opp("n1", { a: "&#" + "0".repeat(n) + "8", b: "3;" + R }));
+      expect(refused(r), `padding ${n}`).toBe(true);
+    }
+  });
+
+  it("OM-R5-SAM-02: a long open escape followed by many short strings stays fast", async () => {
+    for (const x of [["&#" + "0".repeat(4094), ...Array(49000).fill("")], ["&#x" + "0".repeat(4093), ...Array(49000).fill("")]]) {
+      const started = Date.now();
+      expect(refused(await get(opp("n1", { x })))).toBe(false);
+      expect(Date.now() - started, `${x[0].slice(0, 3)} then 49,000 strings`).toBeLessThan(2000);
+    }
+    const grow: string[] = [];
+    while (grow.length < 49000) { grow.push("&#00"); for (let i = 0; i < 4090 && grow.length < 49000; i++) grow.push("0"); }
+    const started = Date.now();
+    expect(refused(await get(opp("n1", { x: grow })))).toBe(false);
+    expect(Date.now() - started, "an escape grown one character per string").toBeLessThan(2000);
+  });
+
+  it("OM-R5-SAM-01 control: the carried match still joins readings of different depths across fields", async () => {
+    // r4 and r5 refuse this (review/r4-omar/probes/attack2.mjs); a joined reading alone would not, so both run.
+    const r = await get(opp("n1", { a: "%2553YNTHETIC-SAM", b: "-SENTINEL-012345%6789" }));
+    expect(refused(r), r).toBe(true);
+  });
+
+  it("OM-R5-SAM-03: a numeric entity beyond U+10FFFF formed across fields does not refuse the response", async () => {
+    for (const record of [opp("n1", { a: "Smith &amp;", b: "#12345678 Main St" }), { noticeId: "n1", "Q&amp;": "#99999999" }, opp("n1", { a: "&#", b: "2000000" })]) {
+      const r = await get(record);
+      expect(refused(r), r).toBe(false);
+      expect(r).not.toContain("REDACTED");
+    }
+  });
+});

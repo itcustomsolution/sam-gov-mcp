@@ -308,9 +308,11 @@ type Scanner = (s: string, start?: Uint32Array) => Scan;
  * `core` follows both readings of every escape at once, so the work stays linear in the string. `start` is a partial
  * match carried from the strings before this one (a key split across neighbouring fields), and `end` is the partial
  * match left at its end. Also a hit when a reading still decodes after MAX_DECODE_ROUNDS rounds, or when the string
- * holds a numeric entity beyond U+10FFFF other than one joined up from inserted characters.
+ * holds a numeric entity beyond U+10FFFF other than one joined up from inserted characters; with `joined` (neighbouring
+ * strings read end to end) such an entity is dropped instead, because one string's end and the next one's start can
+ * form it from ordinary text.
  */
-function keyScanner(core: string): Scanner {
+function keyScanner(core: string, joined = false): Scanner {
   const words = Math.ceil(core.length / 32), top = core.length - 1;
   const masks = new Map<number, Uint32Array>();
   [...core].forEach((c, i) => {
@@ -357,7 +359,7 @@ function keyScanner(core: string): Scanner {
       let t = strip ? s.normalize("NFKC").replace(INSERTED, "") : s.normalize("NFKC");
       for (let round = 0; ; round++) {
         hit = scanRound(t, start, end) || hit;
-        let next = decodeOnce(t, strip);
+        let next = decodeOnce(t, strip || joined);
         if (next === undefined) return { hit: true, end };
         if (strip) next = next.replace(INSERTED, "");
         if (next === t) break;
@@ -409,34 +411,28 @@ export const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
 /** Error bodies are only quoted (300 chars), so read at most this much of them. */
 export const MAX_ERROR_BODY_BYTES = 16 * 1024;
 
-type Stream = { state?: Uint32Array; tail: string };
-/** An escape left open at the end of a string: "%" or "%5", a UTF-8 lead byte still waiting for its continuation bytes
- * ("%E2%80"), "\\", "\\u" to "\\u005", "&", "&#", "&#x5", "&#00000008", or a named entity cut short ("&am"). */
-const OPEN_ESCAPE = /(?:(?:%[0-9a-f]{2}){0,3}%[0-9a-f]?|%[c-f][0-9a-f](?:%[89ab][0-9a-f]){0,2}|\\(?:u[0-9a-f]{0,3})?|&(?:#(?:x0*[0-9a-f]{0,8}|0*\d{0,8}))?|&[a-z][a-z0-9]{0,30})$/i;
-/** How much of a string's end is searched for an open escape; longer zero padding than this is not carried. */
-const MAX_OPEN_ESCAPE = 4096;
-
 /** Recursively redact every string (keys and values) in a parsed JSON value, within structure limits. */
 export function redactDeep<T>(value: T, key?: string): T {
   // A partial match of the key carried through every output string in output order, and separately through the
   // values and through the property names: a key split across neighbouring fields (value and value, name and value,
-  // nested names) shows up only when they are read together. An escape cut off at the end of a string ("%5" before
-  // "3YNTHETIC...", "\\u00", "&#8", a partial UTF-8 sequence) is carried too and read joined to the next string, from
-  // the partial match before it.
-  let all: Stream = { tail: "" }, values: Stream = { tail: "" }, names: Stream = { tail: "" };
-  const follow = (st: Stream, out: string, scan: Scanner, end: Uint32Array): Stream => {
-    let text = out, last = end;
-    if (st.tail || (st.state && st.state.some((w) => w !== 0))) {
-      text = st.tail + out;
-      const r = scan(text, st.state);
-      if (r.hit) throw new SamGovError("SAM.gov response appears to contain the API key split across fields; it was refused and none of it is returned.", undefined, "INVALID_RESPONSE");
-      last = r.end;
-    }
-    const tail = OPEN_ESCAPE.exec(text.slice(-MAX_OPEN_ESCAPE))?.[0] ?? "";
-    return tail ? { state: scan(text.slice(0, text.length - tail.length), st.state).end, tail } : { state: last, tail: "" };
+  // nested names) shows up only when they are read together. The carried match joins readings of different depths
+  // ("%2553YNTHETIC-SAM" then "-SENTINEL-012345%6789"); an escape split at the boundary ("%5" or "%25" before
+  // "3YNTHETIC...", "&amp;#8", a partial UTF-8 sequence) is caught by reading each stream again joined end to end, once,
+  // after the whole value is redacted, so nothing is returned on a hit.
+  let all: Uint32Array | undefined, values: Uint32Array | undefined, names: Uint32Array | undefined;
+  const allParts: string[] = [], valueParts: string[] = [], nameParts: string[] = [];
+  const follow = (state: Uint32Array | undefined, out: string, scan: Scanner, end: Uint32Array) => {
+    if (!state || state.every((w) => w === 0)) return end;
+    const r = scan(out, state);
+    if (r.hit) throw new SamGovError("SAM.gov response appears to contain the API key split across fields; it was refused and none of it is returned.", undefined, "INVALID_RESPONSE");
+    return r.end;
   };
-  const redact = redactor(key, (out, scan, end) => { all = follow(all, out, scan, end); values = follow(values, out, scan, end); });
-  const redactName = redactor(key, (out, scan, end) => { all = follow(all, out, scan, end); names = follow(names, out, scan, end); });
+  const redact = redactor(key, (out, scan, end) => {
+    all = follow(all, out, scan, end); values = follow(values, out, scan, end); allParts.push(out); valueParts.push(out);
+  });
+  const redactName = redactor(key, (out, scan, end) => {
+    all = follow(all, out, scan, end); names = follow(names, out, scan, end); allParts.push(out); nameParts.push(out);
+  });
   let nodes = 0;
   const visit = (v: unknown, depth: number): unknown => {
     if (++nodes > MAX_JSON_NODES || depth > MAX_JSON_DEPTH) throw new SamGovError("SAM.gov response exceeds JSON structure limits; narrow the search.", undefined, "INVALID_RESPONSE");
@@ -462,7 +458,14 @@ export function redactDeep<T>(value: T, key?: string): T {
     }
     return v;
   };
-  return visit(value, 0) as T;
+  const result = visit(value, 0) as T;
+  const core = keyCore(key);
+  if (core) {
+    const joined = keyScanner(core, true);
+    if ([allParts, valueParts, nameParts].some((parts) => parts.length > 1 && joined(parts.join("")).hit))
+      throw new SamGovError("SAM.gov response appears to contain the API key split across fields; it was refused and none of it is returned.", undefined, "INVALID_RESPONSE");
+  }
+  return result;
 }
 
 type Opportunity = Record<string, unknown> & { noticeId: string };
