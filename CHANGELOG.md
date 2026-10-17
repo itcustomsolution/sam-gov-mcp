@@ -68,6 +68,10 @@ is required; the exported `buildSearchUrl` rejects out-of-range `limit`/`offset`
   (OM-R5-SAM-01..04) the boundary is no longer found by matching an open escape in the raw text: all strings in order,
   the values alone and the property names alone are each read again joined end to end, once, after redaction, so an
   escape that decodes to an opener ("%25", "&amp;"), a fullwidth opener and an opener with a character inserted are
-  read across the boundary however long the padding, the crafted responses that made r5 slow cost what they did on r4,
-  and a numeric entity beyond U+10FFFF formed only by the joining is dropped there instead of refusing the response.
-  The carried state of r4 stays, for keys whose parts are encoded to different depths.
+  read across the boundary however long the padding, the crafted responses that made r5 slow take tens of milliseconds
+  again (one shape about twice r4's time), and a numeric entity beyond U+10FFFF formed only by the joining is dropped
+  there instead of refusing the response. The carried state of r4 stays, for keys whose parts are encoded to different
+  depths. A joined reading that still decodes after 8 rounds refuses the response, and each further round of the joined
+  text is another pass over it (README). After the second review round, a property name that gets a numeric suffix
+  after a collision is read with its suffix, so the suffix cannot complete the key with the next value (OM-R5B-SAM-05,
+  present since r4).

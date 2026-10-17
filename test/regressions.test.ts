@@ -889,6 +889,19 @@ describe("r5 review (2026-10-17): split escapes the open-escape pattern did not 
     expect(refused(r), r).toBe(true);
   });
 
+  it("OM-R5B-SAM-05: a collision suffix that completes the key with the next value refuses the response", async () => {
+    // review/r5-omar/round2/probes/suffix.mjs; present since r4: the "_23" suffix was added after the name was scanned.
+    const key = "23SYNTHETIC-SAM-SENTINEL-0123456789";
+    const record: Record<string, unknown> = { noticeId: "n1" };
+    for (let i = 1; i <= 22; i++) record[`api_key=x${i}`] = "v";
+    record["api_key=x23"] = key.slice(2);
+    const r = await outcome(new SamGovClient(key, reply(200, envelope([record])) as any).getOpportunity("n1"));
+    expect(refused(r), r).toBe(true);
+    const control = await get({ noticeId: "n1", "api_key=a": "x", "api_key=b": "y", c: "Completion 100%" });
+    expect(refused(control), control).toBe(false);
+    expect(control).toContain("api_key=REDACTED_2");
+  });
+
   it("OM-R5-SAM-03: a numeric entity beyond U+10FFFF formed across fields does not refuse the response", async () => {
     for (const record of [opp("n1", { a: "Smith &amp;", b: "#12345678 Main St" }), { noticeId: "n1", "Q&amp;": "#99999999" }, opp("n1", { a: "&#", b: "2000000" })]) {
       const r = await get(record);

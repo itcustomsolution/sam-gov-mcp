@@ -450,6 +450,8 @@ export function redactDeep<T>(value: T, key?: string): T {
           while (Object.prototype.hasOwnProperty.call(out, `${base}_${n}`)) n++;
           name = `${base}_${n}`;
           nextSuffix.set(base, n + 1);
+          // The suffix is new text: the joined reading must see the name as returned ("..._23" before its value).
+          if (nameParts.length) allParts[allParts.length - 1] = nameParts[nameParts.length - 1] = name;
         }
         // Define rather than assign so an upstream __proto__ key remains data.
         Object.defineProperty(out, name, { value: visit(item, depth + 1), enumerable: true, configurable: true, writable: true });
