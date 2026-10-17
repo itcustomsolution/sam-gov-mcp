@@ -409,17 +409,31 @@ export const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
 /** Error bodies are only quoted (300 chars), so read at most this much of them. */
 export const MAX_ERROR_BODY_BYTES = 16 * 1024;
 
+type Stream = { state?: Uint32Array; tail: string };
+/** An escape left open at the end of a string: "%" or "%5", a UTF-8 lead byte still waiting for its continuation bytes
+ * ("%E2%80"), "\\", "\\u" to "\\u005", "&", "&#", "&#x5", "&#00000008", or a named entity cut short ("&am"). */
+const OPEN_ESCAPE = /(?:(?:%[0-9a-f]{2}){0,3}%[0-9a-f]?|%[c-f][0-9a-f](?:%[89ab][0-9a-f]){0,2}|\\(?:u[0-9a-f]{0,3})?|&(?:#(?:x0*[0-9a-f]{0,8}|0*\d{0,8}))?|&[a-z][a-z0-9]{0,30})$/i;
+/** How much of a string's end is searched for an open escape; longer zero padding than this is not carried. */
+const MAX_OPEN_ESCAPE = 4096;
+
 /** Recursively redact every string (keys and values) in a parsed JSON value, within structure limits. */
 export function redactDeep<T>(value: T, key?: string): T {
   // A partial match of the key carried through every output string in output order, and separately through the
   // values and through the property names: a key split across neighbouring fields (value and value, name and value,
-  // nested names) shows up only when they are read together.
-  let all: Uint32Array | undefined, values: Uint32Array | undefined, names: Uint32Array | undefined;
-  const follow = (state: Uint32Array | undefined, out: string, scan: Scanner, end: Uint32Array) => {
-    if (!state || state.every((w) => w === 0)) return end;
-    const r = scan(out, state);
-    if (r.hit) throw new SamGovError("SAM.gov response appears to contain the API key split across fields; it was refused and none of it is returned.", undefined, "INVALID_RESPONSE");
-    return r.end;
+  // nested names) shows up only when they are read together. An escape cut off at the end of a string ("%5" before
+  // "3YNTHETIC...", "\\u00", "&#8", a partial UTF-8 sequence) is carried too and read joined to the next string, from
+  // the partial match before it.
+  let all: Stream = { tail: "" }, values: Stream = { tail: "" }, names: Stream = { tail: "" };
+  const follow = (st: Stream, out: string, scan: Scanner, end: Uint32Array): Stream => {
+    let text = out, last = end;
+    if (st.tail || (st.state && st.state.some((w) => w !== 0))) {
+      text = st.tail + out;
+      const r = scan(text, st.state);
+      if (r.hit) throw new SamGovError("SAM.gov response appears to contain the API key split across fields; it was refused and none of it is returned.", undefined, "INVALID_RESPONSE");
+      last = r.end;
+    }
+    const tail = OPEN_ESCAPE.exec(text.slice(-MAX_OPEN_ESCAPE))?.[0] ?? "";
+    return tail ? { state: scan(text.slice(0, text.length - tail.length), st.state).end, tail } : { state: last, tail: "" };
   };
   const redact = redactor(key, (out, scan, end) => { all = follow(all, out, scan, end); values = follow(values, out, scan, end); });
   const redactName = redactor(key, (out, scan, end) => { all = follow(all, out, scan, end); names = follow(names, out, scan, end); });

@@ -787,3 +787,57 @@ describe("r4 review round 2 (omar, 2026-10-17): adjacent percent bytes, escaped 
     expect(redactKey(K.slice(0, 10) + "%E2%80%8B" + K.slice(10), K)).toBe("REDACTED"); // an encoded zero-width space inside
   });
 });
+
+describe("r4 audit (2026-10-17): an escape split across neighbouring fields (R4-SAM-1)", () => {
+  const K = "SYNTHETIC-SAM-SENTINEL-0123456789";
+  const outcome = (p: Promise<unknown>) => p.then((v) => JSON.stringify(v), (e) => `${e.code}: ${e.message}`);
+  const refused = (s: string) => s.startsWith("INVALID_RESPONSE");
+  // The auditor's completed receipts (sam-work/receipts/fresh-*.json): the first field ends inside an escape and the
+  // next completes it.
+  const splits: [string, string, string][] = [
+    ["percent, first byte", "%5", "3YNTHETIC-SAM-SENTINEL-0123456789"],
+    ["JSON \\u, first character", "\\u00", "53YNTHETIC-SAM-SENTINEL-0123456789"],
+    ["HTML numeric, first character", "&#8", "3;YNTHETIC-SAM-SENTINEL-0123456789"],
+    ["percent, last byte", "SYNTHETIC-SAM-SENTINEL-012345678%3", "9"],
+    ["zero-padded entity", "&#00000000000000000000", "83;YNTHETIC-SAM-SENTINEL-0123456789"],
+    ["encoded separator split mid-character", "SYNTHETIC-SAM%E2%80", "%8B-SENTINEL-0123456789"],
+  ];
+
+  it("R4-SAM-1: adjacent values that complete an escape refuse the response", async () => {
+    for (const [kind, a, b] of splits) {
+      const r = await outcome(new SamGovClient(K, reply(200, envelope([opp("n1", { a, b })])) as any).getOpportunity("n1"));
+      expect(refused(r), `values: ${kind}: ${r}`).toBe(true);
+    }
+  });
+
+  it("R4-SAM-1: name and value, array items, search fields and three fields refuse too", async () => {
+    const cases: Record<string, unknown>[] = [
+      { noticeId: "n1", "%5": "3YNTHETIC-SAM-SENTINEL-0123456789" },
+      { noticeId: "n1", parts: ["%5", "3YNTHETIC-SAM-SENTINEL-0123456789"] },
+      { noticeId: "n1", parts: ["%", "5", "3YNTHETIC-SAM-SENTINEL-0123456789"] },
+    ];
+    for (const record of cases) {
+      const r = await outcome(new SamGovClient(K, reply(200, envelope([record])) as any).getOpportunity("n1"));
+      expect(refused(r), JSON.stringify(record).slice(0, 40)).toBe(true);
+    }
+    const s = await outcome(new SamGovClient(K, reply(200, envelope([opp("n1", { title: "%5", solicitationNumber: "3YNTHETIC-SAM-SENTINEL-0123456789" })])) as any).search(range));
+    expect(refused(s), s).toBe(true);
+  });
+
+  it("R4-SAM-1 controls: ordinary fields ending in %, & or \\ are returned unchanged", async () => {
+    const record = { noticeId: "n1", a: "Completion 100%", b: "Q4 2026 budget", c: "R&", d: "D program", e: "C:\\", f: "Users share", g: "&#", h: "38; is an ampersand" };
+    const r = await outcome(new SamGovClient(K, reply(200, envelope([record])) as any).getOpportunity("n1"));
+    expect(refused(r), r).toBe(false);
+    expect(r).toContain("Completion 100%");
+    expect(r).toContain("D program");
+  });
+
+  it("R4-SAM-1 controls: the carried escape stays linear on many short fields", async () => {
+    const record: Record<string, unknown> = { noticeId: "n1" };
+    for (let i = 0; i < 40000; i++) record[`k${i}`] = i % 2 ? "%4" : "1 more";
+    const started = Date.now();
+    const r = await outcome(new SamGovClient(K, reply(200, envelope([record])) as any).getOpportunity("n1"));
+    expect(refused(r)).toBe(false);
+    expect(Date.now() - started).toBeLessThan(5000);
+  });
+});
