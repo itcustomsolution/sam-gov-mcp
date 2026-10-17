@@ -306,6 +306,16 @@ export function parseEnvelope(data: unknown, limit: number, offset: number): { t
 
 export class ResponseTooLarge extends Error {}
 
+/** Rejects with the signal's reason when it aborts (already handled, so it is never an unhandled rejection). */
+function rejectOnAbort(signal: AbortSignal): Promise<never> {
+  const p = new Promise<never>((_, reject) => {
+    if (signal.aborted) reject(signal.reason);
+    signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+  });
+  p.catch(() => {});
+  return p;
+}
+
 /**
  * Read a byte stream, counting bytes as they arrive and cancelling the stream as soon as the
  * running total exceeds `max`. At most `max` bytes plus one chunk are ever held. Decoding is
@@ -319,11 +329,7 @@ export async function readCapped(body: ReadableStream<Uint8Array> | null, max: n
   const decoder = new TextDecoder("utf-8");
   let total = 0;
   let out = "";
-  const aborted = signal && new Promise<never>((_, reject) => {
-    if (signal.aborted) reject(signal.reason);
-    signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-  });
-  aborted?.catch(() => {});
+  const aborted = signal && rejectOnAbort(signal);
   try {
     for (;;) {
       const { done, value } = await (aborted ? Promise.race([reader.read(), aborted]) : reader.read());
@@ -376,9 +382,13 @@ export class SamGovClient {
     // One deadline covers the request, reading the body and the result; cleanup is never awaited past it.
     const signal = AbortSignal.timeout(this.timeoutMs);
     let res;
+    let pending: Promise<Awaited<ReturnType<FetchLike>>> | undefined;
     try {
-      res = await this.fetchImpl(url, { headers: { Accept: "application/json" }, signal });
+      // The deadline holds even for a fetch that ignores the signal; a reply that arrives later is released unread.
+      pending = Promise.resolve(this.fetchImpl(url, { headers: { Accept: "application/json" }, signal }));
+      res = await Promise.race([pending, rejectOnAbort(signal)]);
     } catch (e) {
+      pending?.then((late) => late?.body?.cancel("timed out").catch(() => {}), () => {});
       // Network errors can carry the request URL (which contains the key); never pass them through raw.
       if (isTimeout(e)) throw new SamGovError(`SAM.gov did not respond within ${this.timeoutMs} ms.`, undefined, "TIMEOUT");
       throw new SamGovError(`Could not reach SAM.gov: ${excerpt(String((e as Error)?.message ?? e), this.redact)}`, undefined, "NETWORK_ERROR");

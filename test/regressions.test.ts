@@ -436,3 +436,41 @@ describe("independent re-audit (2026-10-17): redaction boundary, cleanup deadlin
     expect([last.pagination.has_more, last.pagination.next_offset, last.pagination.page_limit_reached]).toEqual([false, null, false]);
   });
 });
+
+describe("r2 audit (2026-10-17): transport deadline, marker collision, transformed keys", () => {
+  const SENTINEL = "SYNTHETIC-SAM-SENTINEL-0123456789";
+  // A reader who undoes common encodings and keeps only letters and digits must not get the key back.
+  const recover = (text: string) => {
+    let t = text;
+    for (let i = 0; i < 4; i++) {
+      t = t.replace(/%([0-9a-f]{2})/gi, (_m, h) => String.fromCharCode(parseInt(h, 16)))
+        .replace(/\\u([0-9a-f]{4})/gi, (_m, h) => String.fromCharCode(parseInt(h, 16)))
+        .replace(/&#x([0-9a-f]+);?/gi, (_m, h) => String.fromCodePoint(parseInt(h, 16)))
+        .replace(/&#(\d+);?/g, (_m, d) => String.fromCodePoint(+d))
+        .replace(/&[a-z]+;/gi, "");
+    }
+    return t.normalize("NFKC").toLowerCase().replace(/[^a-z0-9]/g, "");
+  };
+  const KEYNORM = SENTINEL.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const exposed = (text: string) => recover(text).includes(KEYNORM);
+  const outcome = (p: Promise<unknown>) => p.then((v) => JSON.stringify(v), (e) => `${e.code}: ${e.message}`);
+
+  it("R2-SAM-01: a transport that ignores the abort signal cannot answer after the deadline", async () => {
+    for (const status of [404, 200]) {
+      let bodyCancelled = false;
+      const late = (async () => {
+        await new Promise((r) => setTimeout(r, 60));
+        const body = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(new TextEncoder().encode(JSON.stringify(envelope([])))); }, cancel() { bodyCancelled = true; } });
+        return { ok: status === 200, status, body };
+      }) as any;
+      const started = Date.now();
+      const err: any = await new SamGovClient(KEY, late, undefined, 5).search(range).catch((e) => e);
+      expect(err?.code, `status ${status}`).toBe("TIMEOUT");
+      expect(Date.now() - started).toBeLessThan(50);
+      const err2: any = await new SamGovClient(KEY, late, undefined, 5).getOpportunity("a1").catch((e) => e);
+      expect(err2?.code).toBe("TIMEOUT");
+      await new Promise((r) => setTimeout(r, 100));
+      expect(bodyCancelled, "the late body is released").toBe(true);
+    }
+  });
+});
