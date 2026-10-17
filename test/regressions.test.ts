@@ -521,6 +521,11 @@ describe("r2 audit (2026-10-17): transport deadline, marker collision, transform
     }
   });
 
+  it("PREP-SAM-TRANSFORMED: non-ASCII letters between characters are dropped by the decoded check; ASCII letters are not", () => {
+    for (const sep of ["\u0345", "\u03b9", "\u00e9"]) expect(exposed(redactKey([...SENTINEL].join(sep), SENTINEL)), JSON.stringify(sep)).toBe(false);
+    expect(redactKey([...SENTINEL].join("q"), SENTINEL)).toBe([...SENTINEL].join("q")); // documented: not recognized
+  });
+
   it("PREP-SAM-TRANSFORMED controls: ordinary text, interleaved letters and short keys are left alone", async () => {
     const text = "Synthetic notice: SYNTHETIC SAM 2026, sentinel review 0123.";
     expect(redactKey(text, SENTINEL)).toBe(text);
