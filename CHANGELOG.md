@@ -51,3 +51,4 @@ is required; the exported `buildSearchUrl` rejects out-of-range `limit`/`offset`
   still decodes after 8 rounds is blanked, so deeper nested encodings are covered (OM-R3-SAM-03); many property names
   that redact to the same name are handled in linear time (OM-R3-SAM-04, pre-existing). `lettersAndDigits` returns
   `undefined` for text that does not settle; `MAX_DECODE_ROUNDS` is exported.
+  After the second review round: a reply whose `body` getter throws is released quietly too (OM-R3B-SAM-01).
