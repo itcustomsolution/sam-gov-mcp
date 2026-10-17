@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.2.0-rc.3] - unreleased candidate (2026-10-17, not published; 0.2.0-rc.1 of 2026-10-16 and 0.2.0-rc.2 of 2026-10-17 were the independently audited candidates)
+## [0.2.0-rc.4] - unreleased candidate (2026-10-17, not published; 0.2.0-rc.1 of 2026-10-16, 0.2.0-rc.2 and 0.2.0-rc.3 of 2026-10-17 were the independently audited candidates)
 
 **Breaking:** malformed or mismatched SAM.gov responses are now tool errors; search results gain `pagination` and
 `source`; `get_opportunity` returns `{source, notice}`; tool errors are JSON objects with a `code`; Node 22 or later
@@ -52,3 +52,9 @@ is required; the exported `buildSearchUrl` rejects out-of-range `limit`/`offset`
   that redact to the same name are handled in linear time (OM-R3-SAM-04, pre-existing). `lettersAndDigits` returns
   `undefined` for text that does not settle; `MAX_DECODE_ROUNDS` is exported.
   After the second review round: a reply whose `body` getter throws is released quietly too (OM-R3B-SAM-01).
+- r3 audit fixes (2026-10-17): every string is read three ways before it is returned: as written, decoded, and
+  decoded after inserted characters are removed each round. So a numeric entity padded with leading zeros, a
+  zero-width character inside a percent or `\u` escape, and a `%` written before two of the key's hex digits no
+  longer leave the key recoverable (R3-SAM-01). Numeric entities are read whole; one beyond U+10FFFF blanks the
+  string. The split-field check joins each view. README states the short-key policy exactly: a key under 8
+  characters gets only `api_key=` masking (R3-SAM-02). `keyViews` is exported.
