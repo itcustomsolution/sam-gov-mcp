@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.2.0-rc.1] - unreleased candidate (2026-10-16, not published)
+## [0.2.0-rc.2] - unreleased candidate (2026-10-17, not published; 0.2.0-rc.1 of 2026-10-16 was the independently audited candidate)
 
 **Breaking:** malformed or mismatched SAM.gov responses are now tool errors; search results gain `pagination` and
 `source`; `get_opportunity` returns `{source, notice}`; tool errors are JSON objects with a `code`; Node 22 or later
