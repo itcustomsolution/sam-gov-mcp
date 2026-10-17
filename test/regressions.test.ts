@@ -569,6 +569,22 @@ describe("r3 review (omar, 2026-10-17): late-body cleanup, name/value splits, de
     expect(seen).toEqual([]);
   });
 
+  it("OM-R3B-SAM-01: a reply whose body getter throws, late or 404, never becomes an unhandled rejection", async () => {
+    const seen: unknown[] = [];
+    const onRejection = (e: unknown) => seen.push(e);
+    process.on("unhandledRejection", onRejection);
+    try {
+      const reply404 = { ok: false, status: 404, get body(): never { throw new Error("body getter failed"); } };
+      const late = (async () => { await new Promise((r) => setTimeout(r, 30)); return { ok: true, status: 200, get body(): never { throw new Error("body getter failed"); } }; }) as any;
+      expect((await new SamGovClient(KEY, late, undefined, 5).search(range).catch((e) => e))?.code).toBe("TIMEOUT");
+      expect((await new SamGovClient(KEY, (async () => reply404) as any).search(range)).total).toBe(0);
+      await new Promise((r) => setTimeout(r, 100));
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
+    expect(seen).toEqual([]);
+  });
+
   it("OM-R3-SAM-02: a key split between a property name and its value, or across nested names, refuses the response", async () => {
     for (const record of [{ noticeId: "a1", title: "t", [SENTINEL.slice(0, 15)]: SENTINEL.slice(15) },
                           { noticeId: "a1", title: "t", SYNTHETIC: { SAM: { SENTINEL: "0123456789" } } }]) {

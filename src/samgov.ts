@@ -386,12 +386,16 @@ export function parseEnvelope(data: unknown, limit: number, offset: number): { t
 
 export class ResponseTooLarge extends Error {}
 
-/** Starts releasing a body without waiting for it; a missing, throwing or rejecting cancel is ignored. */
-function release(body: unknown, why: string): void {
+/**
+ * Starts releasing a reply's body without waiting for it. The body is read inside the guard too, so a missing body,
+ * a throwing body getter, or a missing, throwing or rejecting cancel is ignored.
+ */
+function release(reply: unknown, why: string): void {
   try {
-    Promise.resolve((body as { cancel?: (reason: string) => unknown } | null | undefined)?.cancel?.(why)).catch(() => {});
+    const body = (reply as { body?: unknown } | null | undefined)?.body as { cancel?: (reason: string) => unknown } | null | undefined;
+    Promise.resolve(body?.cancel?.(why)).catch(() => {});
   } catch {
-    // A body outside the FetchLike contract whose cancel throws: there is nothing more to release.
+    // A reply outside the FetchLike contract: there is nothing more to release.
   }
 }
 
@@ -478,7 +482,7 @@ export class SamGovClient {
       pending = Promise.resolve(this.fetchImpl(url, { headers: { Accept: "application/json" }, signal }));
       res = await Promise.race([pending, rejectOnAbort(signal)]);
     } catch (e) {
-      pending?.then((late) => release(late?.body, "timed out"), () => {});
+      pending?.then((late) => release(late, "timed out"), () => {});
       // Network errors can carry the request URL (which contains the key); never pass them through raw.
       if (isTimeout(e)) throw new SamGovError(`SAM.gov did not respond within ${this.timeoutMs} ms.`, undefined, "TIMEOUT");
       throw new SamGovError(`Could not reach SAM.gov: ${excerpt(String((e as Error)?.message ?? e), this.redact)}`, undefined, "NETWORK_ERROR");
@@ -486,7 +490,7 @@ export class SamGovClient {
     // Per the Get Opportunities API docs, HTTP 404 means "No Data found", not an error. Release the body
     // without waiting for the cancellation to finish (a stalled cancel must not hold the result).
     if (res.status === 404) {
-      release(res.body, "no data");
+      release(res, "no data");
       return NO_DATA;
     }
     if (!res.ok) {
