@@ -52,8 +52,9 @@ Search results are summarized to: `noticeId`, `title`, `solicitationNumber`, `ag
 Per the GSA documentation, `offset` is a page index, not a record offset: page *N* holds records
 *N* x `limit` to *N* x `limit` + `limit` - 1. Each search returns one page and never fetches more on its
 own. The result's `pagination` object says where you are: `page_index`, `page_size`, `returned_count`,
-`has_more`, `next_offset` (pass it back as `offset`, or `null` when there is no next page) and `partial`
-(true unless this single page holds every matching record). `total` is SAM.gov's `totalRecords`; it is `null`
+`has_more`, `next_offset` (pass it back as `offset`, or `null` when there is no next page), `partial`
+(true unless this single page holds every matching record) and `page_limit_reached` (true when more records
+exist but the next page index would exceed 1,000,000; narrow the search or use a larger page size). `total` is SAM.gov's `totalRecords`; it is `null`
 when a page after the first returns HTTP 404, because that reply does not say how many records exist.
 
 ### Errors
@@ -83,13 +84,15 @@ release, so a live reply that GSA formats differently may be refused.
 
 ## Security notes
 
-- SAM.gov requires the key as an `api_key` query parameter, so it travels in the request URL to `api.sam.gov` over HTTPS. The server removes it from errors, links and returned JSON: any `api_key=` value, and, for keys of 8 or more characters, the key itself written literally, percent-encoded (either hex case, also repeated), form-encoded or JSON-escaped, including when line breaks, control or invisible characters are inserted between its characters. Other encodings (HTML entities, base64) are not recognized. Anything that logs full URLs (an HTTP proxy, for example) would see the key.
+- SAM.gov requires the key as an `api_key` query parameter, so it travels in the request URL to `api.sam.gov` over HTTPS. The server removes it from errors, links and returned JSON: any `api_key=` value, and, for keys of 8 or more characters, the key itself written literally, percent-encoded (either hex case, also repeated), form-encoded or JSON-escaped, including when any number of line breaks, control or invisible characters are inserted between its characters. Other encodings (HTML entities, base64) are not recognized. Anything that logs full URLs (an HTTP proxy, for example) would see the key.
 - Notice text, links and upstream error text are third-party content. Every result carries a `source` note saying
   so, upstream and network error excerpts are labelled `[untrusted upstream text]` with control, bidirectional
   and invisible formatting characters removed, and both content tools say it in their
   descriptions. Treat all of it as data, not instructions (prompt injection); this server does not and cannot
   make a model resistant to it.
-- Responses over 5 MB are refused and requests time out after 30 s.
+- Responses over 5 MB are refused. Each request has a 30 s deadline that covers reading the response body; cleanup
+  of an unused body is started but never waited for. An HTTP error status that arrived before the deadline is
+  reported as `UPSTREAM_HTTP_ERROR`, with a note if its body could not be read in time.
 
 ## Development
 

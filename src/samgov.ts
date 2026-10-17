@@ -70,8 +70,10 @@ export interface Pagination {
   /** True unless this single page holds every matching record. */
   partial: boolean;
   has_more: boolean;
-  /** Pass as `offset` to get the next page; null when there is none. */
+  /** Pass as `offset` to get the next page; null when there is none or the page-index limit is reached. */
   next_offset: number | null;
+  /** True when more records exist upstream but the next page index would exceed MAX_PAGE_INDEX. */
+  page_limit_reached: boolean;
 }
 
 export interface SearchResult {
@@ -182,9 +184,10 @@ export function summarize(o: any): OpportunitySummary {
 
 /**
  * Matches the key however an upstream might echo it: each character literal, percent-encoded (either hex
- * case, any number of times), form-encoded or JSON \u-escaped, with up to 16 whitespace, control or format
+ * case, any number of times), form-encoded or JSON \u-escaped, with any number of whitespace, control or format
  * characters between characters (a wrapped or NUL-split key). Case-insensitive, so a case variant of the key
- * is also removed. Not covered: other encodings such as HTML entities or base64.
+ * is also removed. Not covered: other encodings such as HTML entities or base64. The separator class cannot
+ * match a key character or the start of an encoded one, so matching stays linear in the text length.
  */
 function keyPattern(key: string): RegExp | undefined {
   // ponytail: keys shorter than 8 characters are not plausible SAM keys; redacting them as substrings would
@@ -198,7 +201,7 @@ function keyPattern(key: string): RegExp | undefined {
     if (c === '"' || c === "\\" || c === "/") alts.push(`\\\\${alts[0]}`); // JSON short escapes
     return `(?:${alts.join("|")})`;
   };
-  return new RegExp([...key].map(char).join("[\\s\\p{Cc}\\p{Cf}]{0,16}"), "giu");
+  return new RegExp([...key].map(char).join("[\\s\\p{Cc}\\p{Cf}]*"), "giu");
 }
 
 function redactor(key?: string): (s: string) => string {
@@ -292,28 +295,42 @@ export class ResponseTooLarge extends Error {}
 /**
  * Read a byte stream, counting bytes as they arrive and cancelling the stream as soon as the
  * running total exceeds `max`. At most `max` bytes plus one chunk are ever held. Decoding is
- * streaming UTF-8, so multibyte characters split across chunks are handled.
+ * streaming UTF-8, so multibyte characters split across chunks are handled. With `signal`, a read
+ * that is still waiting when the signal aborts rejects with its reason, even if the stream ignores it.
+ * Cancellation is started but never awaited, so a stalled cancel cannot delay the result.
  */
-export async function readCapped(body: ReadableStream<Uint8Array> | null, max: number): Promise<string> {
+export async function readCapped(body: ReadableStream<Uint8Array> | null, max: number, signal?: AbortSignal): Promise<string> {
   if (!body) return "";
   const reader = body.getReader();
   const decoder = new TextDecoder("utf-8");
   let total = 0;
   let out = "";
+  const aborted = signal && new Promise<never>((_, reject) => {
+    if (signal.aborted) reject(signal.reason);
+    signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+  });
+  aborted?.catch(() => {});
   try {
     for (;;) {
-      const { done, value } = await reader.read();
+      const { done, value } = await (aborted ? Promise.race([reader.read(), aborted]) : reader.read());
       if (done) break;
       total += value.byteLength;
       if (total > max) {
-        await reader.cancel("response exceeds size cap").catch(() => {});
+        reader.cancel("response exceeds size cap").catch(() => {});
         throw new ResponseTooLarge(`response exceeds ${max} bytes`);
       }
       out += decoder.decode(value, { stream: true });
     }
     return out + decoder.decode();
+  } catch (e) {
+    if (aborted && signal?.aborted) reader.cancel(signal.reason).catch(() => {});
+    throw e;
   } finally {
-    reader.releaseLock?.();
+    try {
+      reader.releaseLock?.();
+    } catch {
+      // A read still pending after an abort can keep the lock; the stream is being cancelled.
+    }
   }
 }
 
@@ -341,31 +358,36 @@ export class SamGovClient {
   }
 
   private async get(url: string): Promise<unknown> {
+    // One deadline covers the request, reading the body and the result; cleanup is never awaited past it.
+    const signal = AbortSignal.timeout(this.timeoutMs);
     let res;
     try {
-      res = await this.fetchImpl(url, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(this.timeoutMs) });
+      res = await this.fetchImpl(url, { headers: { Accept: "application/json" }, signal });
     } catch (e) {
       // Network errors can carry the request URL (which contains the key); never pass them through raw.
       if (isTimeout(e)) throw new SamGovError(`SAM.gov did not respond within ${this.timeoutMs} ms.`, undefined, "TIMEOUT");
       throw new SamGovError(`Could not reach SAM.gov: ${excerpt(String((e as Error)?.message ?? e), this.redact)}`, undefined, "NETWORK_ERROR");
     }
-    // Per the Get Opportunities API docs, HTTP 404 means "No Data found", not an error. Release the body.
+    // Per the Get Opportunities API docs, HTTP 404 means "No Data found", not an error. Release the body
+    // without waiting for the cancellation to finish (a stalled cancel must not hold the result).
     if (res.status === 404) {
-      await res.body?.cancel("no data").catch(() => {});
+      res.body?.cancel("no data").catch(() => {});
       return NO_DATA;
     }
     if (!res.ok) {
+      // The HTTP status is already known, so it is reported even if reading the body times out.
       let body: string;
       try {
-        body = excerpt(await readCapped(res.body, MAX_ERROR_BODY_BYTES), this.redact);
+        body = excerpt(await readCapped(res.body, MAX_ERROR_BODY_BYTES, signal), this.redact);
       } catch (e) {
-        body = e instanceof ResponseTooLarge ? "(error body too large; not read)" : "(error body could not be read)";
+        body = e instanceof ResponseTooLarge ? "(error body too large; not read)"
+          : isTimeout(e) ? `(error body not read within ${this.timeoutMs} ms)` : "(error body could not be read)";
       }
       throw new SamGovError(`SAM.gov returned HTTP ${res.status}: ${body}`, res.status, "UPSTREAM_HTTP_ERROR");
     }
     let raw: string;
     try {
-      raw = await readCapped(res.body, MAX_RESPONSE_BYTES);
+      raw = await readCapped(res.body, MAX_RESPONSE_BYTES, signal);
     } catch (e) {
       if (e instanceof ResponseTooLarge) throw new SamGovError("SAM.gov response too large; narrow the search.", undefined, "RESPONSE_TOO_LARGE");
       if (isTimeout(e)) throw new SamGovError(`SAM.gov did not finish responding within ${this.timeoutMs} ms.`, undefined, "TIMEOUT");
@@ -386,14 +408,17 @@ export class SamGovClient {
     const data = await this.get(url);
     // 404 is "no data": an empty result. After the first page it does not say how many records exist.
     const { total, list } = data === NO_DATA ? { total: offset === 0 ? 0 : null, list: [] } : parseEnvelope(data, limit, offset);
-    const hasMore = total !== null && (offset + 1) * limit < total && offset < MAX_PAGE_INDEX;
+    // Whether records remain upstream is separate from whether this client can request the next page index.
+    const hasMore = total !== null && (offset + 1) * limit < total;
+    const atLimit = hasMore && offset >= MAX_PAGE_INDEX;
     const pagination: Pagination = {
       page_index: offset,
       page_size: limit,
       returned_count: list.length,
       partial: !(offset === 0 && list.length === total),
       has_more: hasMore,
-      next_offset: hasMore ? offset + 1 : null,
+      next_offset: hasMore && !atLimit ? offset + 1 : null,
+      page_limit_reached: atLimit,
     };
     return redactDeep({ total, results: list.map(summarize), pagination, source: SOURCE_NOTICE }, this.apiKey);
   }

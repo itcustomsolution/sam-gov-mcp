@@ -27,3 +27,8 @@ is required; the exported `buildSearchUrl` rejects out-of-range `limit`/`offset`
   JSON-escaped with `\u` or short escapes, and runs before excerpts are normalized and truncated; record keys
   that redact to the same name are both kept; a timeout while reading the body is `TIMEOUT`; network error text is
   labelled and sanitized; HTTP 404 after the first page reports `total: null`.
+- Independent re-audit fixes (2026-10-17): a key split by any number of whitespace, control or invisible characters
+  is removed (the limit was 16; SAM-REA-01); body cancellation is never awaited and body reads observe the request
+  deadline, so a stalled transport cannot hold a result past the timeout (SAM-REA-02); at the page-index limit
+  `has_more` stays true and the new `pagination.page_limit_reached` explains the missing `next_offset` (SAM-REA-03);
+  an HTTP error whose body times out says so. `readCapped` takes an optional `AbortSignal`.

@@ -141,7 +141,7 @@ describe("SAM-04: one page at a time, with explicit page context", () => {
   it("a middle page reports has_more and the next page index; exactly one request is made", async () => {
     const f = reply(200, envelope(Array.from({ length: 10 }, (_, i) => opp(`n${i}`)), 500));
     const r = await new SamGovClient(KEY, f as any).search({ ...range, limit: 10, offset: 2 });
-    expect(r.pagination).toEqual({ page_index: 2, page_size: 10, returned_count: 10, partial: true, has_more: true, next_offset: 3 });
+    expect(r.pagination).toEqual({ page_index: 2, page_size: 10, returned_count: 10, partial: true, has_more: true, next_offset: 3, page_limit_reached: false });
     expect(f).toHaveBeenCalledTimes(1);
     expect(new URL(f.mock.calls[0][0]).searchParams.get("offset")).toBe("2");
   });
@@ -329,5 +329,66 @@ describe("independent review round (2026-10-16): residual envelope, redaction an
     expect([r.total, r.results.length, r.pagination.has_more, r.pagination.partial]).toEqual([null, 0, false, true]);
     const first = await new SamGovClient(KEY, (async () => ({ ok: false, status: 404, body: null })) as any).search(range);
     expect(first.total).toBe(0);
+  });
+});
+
+describe("independent re-audit (2026-10-17): redaction boundary, cleanup deadline, page-index limit", () => {
+  const SENTINEL = "SYNTHETIC-SAM-SENTINEL-0123456789";
+  const recoverable = (text: string) => text.replace(/[\s\p{Cc}\p{Cf}]|\\u200b|\\u0000/gu, "").includes(SENTINEL);
+
+  it("SAM-REA-01: a key split by any number of invisible, control or whitespace characters is removed", async () => {
+    for (const n of [1, 16, 17, 64, 4096]) {
+      for (const sep of ["\u200b", "\u0000", " ", "\r\n", "\u2060\ufeff"]) {
+        const split = SENTINEL.slice(0, 10) + sep.repeat(n) + SENTINEL.slice(10);
+        // Either redacted, or refused as an over-long field (INVALID_RESPONSE): never returned recoverable.
+        const ok = await new SamGovClient(SENTINEL, reply(200, envelope([opp("a1", { title: split })])) as any).search(range)
+          .then((v) => JSON.stringify(v), (e) => `${e.code}: ${e.message}`);
+        expect(recoverable(ok), `success n=${n}`).toBe(false);
+        const err: any = await new SamGovClient(SENTINEL, reply(502, `echo ${split}`) as any).search(range).catch((e) => e);
+        expect(recoverable(err.message), `error n=${n}`).toBe(false);
+      }
+    }
+    const { call } = await mcp(reply(200, envelope([opp("a1", { title: SENTINEL.slice(0, 5) + "\u200b".repeat(17) + SENTINEL.slice(5) })])), SENTINEL);
+    const out = await call("search_opportunities", { posted_from: "2026-01-01", posted_to: "2026-01-31" });
+    expect(recoverable(JSON.stringify(out.body))).toBe(false);
+  });
+
+  it("SAM-REA-01: matching stays fast on long runs of separator characters", async () => {
+    const text = ("S" + "\u200b".repeat(2000)).repeat(250); // about 500,000 characters, no key
+    const started = Date.now();
+    expect(redactKey(text, SENTINEL)).toBe(text);
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+
+  it("SAM-REA-02: a 404 whose body cancellation never settles still returns promptly", async () => {
+    let release!: () => void;
+    const pending = new Promise<void>((r) => { release = r; });
+    const body = new ReadableStream<Uint8Array>({ pull() {}, cancel() { return pending; } });
+    const p = new SamGovClient(KEY, (async () => ({ ok: false, status: 404, body })) as any, undefined, 50).search(range);
+    const state = await Promise.race([p.then(() => "returned"), new Promise((r) => setTimeout(() => r("still pending"), 300))]);
+    release();
+    expect(state).toBe("returned");
+  });
+
+  it("SAM-REA-02: a body that ignores the timeout signal is cut off at the deadline", async () => {
+    let release!: () => void;
+    const pending = new Promise<void>((r) => { release = r; });
+    const stall = () => new ReadableStream<Uint8Array>({ pull() { return pending; }, cancel() { return pending; } });
+    for (const status of [200, 503]) {
+      const started = Date.now();
+      const err: any = await new SamGovClient(KEY, (async () => ({ ok: status === 200, status, body: stall() })) as any, undefined, 50).search(range).catch((e) => e);
+      expect(Date.now() - started).toBeLessThan(1000);
+      expect(err.code).toBe(status === 200 ? "TIMEOUT" : "UPSTREAM_HTTP_ERROR");
+      if (status === 503) expect(err.message).toContain("not read within 50 ms");
+    }
+    release();
+  });
+
+  it("SAM-REA-03: at the page-index limit, has_more stays true and page_limit_reached says why there is no next_offset", async () => {
+    const r = await new SamGovClient(KEY, reply(200, { totalRecords: 1000002, limit: 1, offset: MAX_PAGE_INDEX, opportunitiesData: [opp("a1")] }) as any)
+      .search({ ...range, limit: 1, offset: MAX_PAGE_INDEX });
+    expect([r.pagination.has_more, r.pagination.next_offset, r.pagination.page_limit_reached, r.pagination.partial]).toEqual([true, null, true, true]);
+    const last = await new SamGovClient(KEY, reply(200, envelope([opp("a1")], 1)) as any).search(range);
+    expect([last.pagination.has_more, last.pagination.next_offset, last.pagination.page_limit_reached]).toEqual([false, null, false]);
   });
 });
