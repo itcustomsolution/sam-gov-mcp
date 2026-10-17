@@ -4,7 +4,7 @@ import { describe, it, expect, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { SamGovClient, SamGovError, buildSearchUrl, redactKey, MAX_PAGE_INDEX } from "../src/samgov.js";
+import { SamGovClient, SamGovError, buildSearchUrl, redactKey, redactDeep, MAX_PAGE_INDEX } from "../src/samgov.js";
 import { createServer } from "../src/server.js";
 
 const KEY = "SYNTHETIC-sentinel-key-0123456789abcdef";
@@ -537,5 +537,68 @@ describe("r2 audit (2026-10-17): transport deadline, marker collision, transform
     const started = Date.now();
     expect(redactKey(big, SENTINEL)).toBe(big);
     expect(Date.now() - started).toBeLessThan(2000);
+  });
+});
+
+describe("r3 review (omar, 2026-10-17): late-body cleanup, name/value splits, deep encodings, duplicate names", () => {
+  const SENTINEL = "SYNTHETIC-SAM-SENTINEL-0123456789";
+  const core = SENTINEL.toLowerCase().replace(/[^a-z0-9]/g, "");
+  // A reader that decodes to a fixpoint, with no round limit.
+  const once = (t: string) => t.replace(/%([0-9a-f]{2})/gi, (_m, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/\\u([0-9a-f]{4})/gi, (_m, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/&#x([0-9a-f]+);?/gi, (_m, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);?/g, (_m, d) => String.fromCodePoint(+d)).replace(/&[a-z]+;/gi, "");
+  const exposed = (s: string) => { let t = s; for (let i = 0; i < 50; i++) { const n = once(t); if (n === t) break; t = n; } return t.normalize("NFKC").toLowerCase().replace(/[^a-z0-9]/g, "").includes(core); };
+  const outcome = (p: Promise<unknown>) => p.then((v) => JSON.stringify(v), (e) => `${e.code}: ${e.message}`);
+
+  it("OM-R3-SAM-01: a late reply whose body has no working cancel never becomes an unhandled rejection", async () => {
+    const seen: unknown[] = [];
+    const onRejection = (e: unknown) => seen.push(e);
+    process.on("unhandledRejection", onRejection);
+    try {
+      for (const body of [{}, { cancel: () => 1 }, { cancel: () => { throw new Error("cancel failed"); } }, { cancel: async () => { throw new Error("async cancel failed"); } }]) {
+        const late = (async () => { await new Promise((r) => setTimeout(r, 30)); return { ok: true, status: 200, body }; }) as any;
+        expect((await new SamGovClient(KEY, late, undefined, 5).search(range).catch((e) => e))?.code).toBe("TIMEOUT");
+        const notFound = (async () => ({ ok: false, status: 404, body })) as any; // an out-of-contract 404 body is released quietly too
+        expect((await new SamGovClient(KEY, notFound).search(range)).total).toBe(0);
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
+    expect(seen).toEqual([]);
+  });
+
+  it("OM-R3-SAM-02: a key split between a property name and its value, or across nested names, refuses the response", async () => {
+    for (const record of [{ noticeId: "a1", title: "t", [SENTINEL.slice(0, 15)]: SENTINEL.slice(15) },
+                          { noticeId: "a1", title: "t", SYNTHETIC: { SAM: { SENTINEL: "0123456789" } } }]) {
+      const out = await outcome(new SamGovClient(SENTINEL, reply(200, envelope([record])) as any).getOpportunity("a1"));
+      expect(out.startsWith("INVALID_RESPONSE"), out).toBe(true);
+      expect(exposed(out)).toBe(false);
+    }
+  });
+
+  it("OM-R3-SAM-03: a key under any number of nested encodings is not recoverable", async () => {
+    const nest = (c: string, layers: number) => { let s = "%" + c.charCodeAt(0).toString(16); for (let i = 0; i < layers; i++) s = s.replace(/^[%&]/, (x) => `&#${x.charCodeAt(0)};`); return s; };
+    const nestU = (c: string, layers: number) => { let s = "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"); for (let i = 1; i < layers; i++) s = "\\u005c" + s.slice(1); return s; };
+    for (const layers of [3, 4, 6, 12]) {
+      for (const value of [[...SENTINEL].map((c) => nest(c, layers)).join(""), [...SENTINEL].map((c) => nestU(c, layers)).join("")]) {
+        const ok = await outcome(new SamGovClient(SENTINEL, reply(200, envelope([opp("a1", { title: `see ${value} end` })])) as any).search(range));
+        expect(exposed(ok), `search, ${layers} layers`).toBe(false);
+        expect(exposed(redactKey(value, SENTINEL)), `redactKey, ${layers} layers`).toBe(false);
+      }
+    }
+    const text = "Synthetic notice 2026 %2541 &#38;amp; \\u005c";
+    expect(redactKey(text, SENTINEL)).toBe(text); // shallow encodings without the key are left alone
+  });
+
+  it("OM-R3-SAM-04: many property names that redact to the same name are handled in linear time", async () => {
+    const record: Record<string, unknown> = { noticeId: "a1" };
+    // 20,000 distinct names that all redact to "REDACTED": the key with i written in invisible binary after its first character.
+    for (let i = 0; i < 20000; i++) record[SENTINEL[0] + i.toString(2).replace(/0/g, "\u200b").replace(/1/g, "\u200c") + SENTINEL.slice(1)] = i;
+    const started = Date.now();
+    const r = redactDeep(record, SENTINEL) as Record<string, unknown>;
+    expect(Date.now() - started).toBeLessThan(3000);
+    expect(Object.keys(r).length).toBe(Object.keys(record).length);
   });
 });

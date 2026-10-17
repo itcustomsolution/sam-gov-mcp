@@ -227,15 +227,28 @@ function keyCore(key?: string): string | undefined {
 
 const UTF8 = new TextDecoder("utf-8");
 
+export const MAX_DECODE_ROUNDS = 8;
+
 /**
  * The letters and digits of `s`, case-folded, after undoing the encodings an upstream might apply: percent-encoding
- * (repeated encoding of "%" collapsed), JSON \u escapes and HTML numeric entities, three rounds for nested forms;
- * named HTML entities are dropped, and NFKC folds compatibility forms such as fullwidth letters. Linear in `s`.
+ * (repeated encoding of "%" collapsed), JSON \u escapes and HTML numeric entities, round after round until nothing
+ * changes; named HTML entities are dropped, and NFKC folds compatibility forms such as fullwidth letters. Undefined
+ * when the text still decodes further after MAX_DECODE_ROUNDS rounds, which the redactor treats as possibly the key.
+ * Linear in `s`.
  */
-export function lettersAndDigits(s: string): string {
+export function lettersAndDigits(s: string): string | undefined {
   let t = s;
-  for (let round = 0; round < 3; round++) {
-    t = t.replace(/%(?:25)+(?=[0-9a-f]{2})/gi, "%")
+  for (let round = 0; ; round++) {
+    const next = decodeOnce(t);
+    if (next === t) break;
+    if (round === MAX_DECODE_ROUNDS) return undefined;
+    t = next;
+  }
+  return t.normalize("NFKC").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function decodeOnce(t: string): string {
+  return t.replace(/%(?:25)+(?=[0-9a-f]{2})/gi, "%")
       .replace(/(?:%[0-9a-f]{2})+/gi, (run) => UTF8.decode(Uint8Array.from(run.slice(1).split("%"), (h) => parseInt(h, 16))))
       .replace(/\\u([0-9a-f]{4})/gi, (_m, h) => String.fromCharCode(parseInt(h, 16)))
       .replace(/&#(?:x([0-9a-f]{1,6})|(\d{1,7}));?/gi, (_m, h, d) => {
@@ -243,8 +256,6 @@ export function lettersAndDigits(s: string): string {
         return cp <= 0x10ffff ? String.fromCodePoint(cp) : "";
       })
       .replace(/&[a-z][a-z0-9]{1,31};/gi, "");
-  }
-  return t.normalize("NFKC").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
 /**
@@ -260,7 +271,7 @@ function redactor(key?: string, seen?: (lettersAndDigits: string) => void): (s: 
       .replace(/api_key=[^&\s"']+/gi, "api_key=REDACTED").replace(/api_key%3D(?:[^&%\s"']|%(?!26)[0-9a-f]{2})+/gi, "api_key%3DREDACTED");
     if (!core) return out;
     const letters = lettersAndDigits(out);
-    if (letters.includes(core)) {
+    if (letters === undefined || letters.includes(core)) {
       seen?.("redacted");
       return "REDACTED";
     }
@@ -290,12 +301,14 @@ export const MAX_ERROR_BODY_BYTES = 16 * 1024;
 
 /** Recursively redact every string (keys and values) in a parsed JSON value, within structure limits. */
 export function redactDeep<T>(value: T, key?: string): T {
-  // The letters and digits of every output value, and separately of every property name, in output order: a key
-  // split across neighbouring fields shows up only when they are read together.
+  // The letters and digits of every output string in output order, and separately of the values and of the property
+  // names: a key split across neighbouring fields (value and value, name and value, nested names) shows up only when
+  // they are read together.
+  let all = "";
   let values = "";
   let names = "";
-  const redact = redactor(key, (letters) => { values += letters; });
-  const redactName = redactor(key, (letters) => { names += letters; });
+  const redact = redactor(key, (letters) => { values += letters; all += letters; });
+  const redactName = redactor(key, (letters) => { names += letters; all += letters; });
   let nodes = 0;
   const visit = (v: unknown, depth: number): unknown => {
     if (++nodes > MAX_JSON_NODES || depth > MAX_JSON_DEPTH) throw new SamGovError("SAM.gov response exceeds JSON structure limits; narrow the search.", undefined, "INVALID_RESPONSE");
@@ -303,11 +316,17 @@ export function redactDeep<T>(value: T, key?: string): T {
     if (Array.isArray(v)) return v.map((item) => visit(item, depth + 1));
     if (v && typeof v === "object") {
       const out: Record<string, unknown> = {};
+      const nextSuffix = new Map<string, number>(); // per name, so many collisions stay linear
       for (const [k, item] of Object.entries(v)) {
         // Two keys that redact to the same name both stay: the later one gets a numeric suffix.
         const base = redactName(k);
         let name = base;
-        for (let n = 2; Object.prototype.hasOwnProperty.call(out, name); n++) name = `${base}_${n}`;
+        if (Object.prototype.hasOwnProperty.call(out, name)) {
+          let n = nextSuffix.get(base) ?? 2;
+          while (Object.prototype.hasOwnProperty.call(out, `${base}_${n}`)) n++;
+          name = `${base}_${n}`;
+          nextSuffix.set(base, n + 1);
+        }
         // Define rather than assign so an upstream __proto__ key remains data.
         Object.defineProperty(out, name, { value: visit(item, depth + 1), enumerable: true, configurable: true, writable: true });
       }
@@ -317,7 +336,7 @@ export function redactDeep<T>(value: T, key?: string): T {
   };
   const out = visit(value, 0) as T;
   const core = keyCore(key);
-  if (core && (values.includes(core) || names.includes(core)))
+  if (core && (all.includes(core) || values.includes(core) || names.includes(core)))
     throw new SamGovError("SAM.gov response appears to contain the API key split across fields; it was refused and none of it is returned.", undefined, "INVALID_RESPONSE");
   return out;
 }
@@ -366,6 +385,15 @@ export function parseEnvelope(data: unknown, limit: number, offset: number): { t
 }
 
 export class ResponseTooLarge extends Error {}
+
+/** Starts releasing a body without waiting for it; a missing, throwing or rejecting cancel is ignored. */
+function release(body: unknown, why: string): void {
+  try {
+    Promise.resolve((body as { cancel?: (reason: string) => unknown } | null | undefined)?.cancel?.(why)).catch(() => {});
+  } catch {
+    // A body outside the FetchLike contract whose cancel throws: there is nothing more to release.
+  }
+}
 
 /** Rejects with the signal's reason when it aborts (already handled, so it is never an unhandled rejection). */
 function rejectOnAbort(signal: AbortSignal): Promise<never> {
@@ -450,7 +478,7 @@ export class SamGovClient {
       pending = Promise.resolve(this.fetchImpl(url, { headers: { Accept: "application/json" }, signal }));
       res = await Promise.race([pending, rejectOnAbort(signal)]);
     } catch (e) {
-      pending?.then((late) => late?.body?.cancel("timed out").catch(() => {}), () => {});
+      pending?.then((late) => release(late?.body, "timed out"), () => {});
       // Network errors can carry the request URL (which contains the key); never pass them through raw.
       if (isTimeout(e)) throw new SamGovError(`SAM.gov did not respond within ${this.timeoutMs} ms.`, undefined, "TIMEOUT");
       throw new SamGovError(`Could not reach SAM.gov: ${excerpt(String((e as Error)?.message ?? e), this.redact)}`, undefined, "NETWORK_ERROR");
@@ -458,7 +486,7 @@ export class SamGovClient {
     // Per the Get Opportunities API docs, HTTP 404 means "No Data found", not an error. Release the body
     // without waiting for the cancellation to finish (a stalled cancel must not hold the result).
     if (res.status === 404) {
-      res.body?.cancel("no data").catch(() => {});
+      release(res.body, "no data");
       return NO_DATA;
     }
     if (!res.ok) {
