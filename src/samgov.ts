@@ -184,13 +184,17 @@ export function summarize(o: any): OpportunitySummary {
 
 /** Hangul fillers render as nothing but are letters, so the letter exclusion in keyPattern would keep them. */
 const INVISIBLE_LETTERS = "\u115f\u1160\u3164\uffa0";
-/** SAM keys are 40 printable ASCII characters; anything else is a misconfiguration and is refused, never echoed. */
-export const VALID_KEY = /^[\x21-\x7e]{1,256}$/;
+/**
+ * GSA does not document the key format; keys seen in practice are short alphanumeric strings. A key outside printable
+ * ASCII, or containing a space, "%" or "\\", is refused and never echoed: "%" and "\\" are the characters whose encoded
+ * forms overlap their own literal form, which would make redaction ambiguous (and exponential on runs of them).
+ */
+export const VALID_KEY = /^[\x21-\x24\x26-\x5b\x5d-\x7e]{1,256}$/;
 
 /**
  * Matches the key however an upstream might echo it: each character literal, percent-encoded (either hex
  * case, any number of times) or JSON \u-escaped, with any number of separators between characters. A separator is
- * any character that is not a letter or digit (under case folding), not "%" or "\\", and not one of the key's own
+ * any character that is not a letter or number (under case folding), not "%" or "\\", and not one of the key's own
  * characters; Hangul fillers are separators too. "%" and "\\" begin an encoded key character, so excluding them and
  * the key's own characters keeps the separator set disjoint from every key element by construction, and matching
  * stays linear in the text length. Case-insensitive, so a case variant of the key is also removed. Not covered:
@@ -206,7 +210,7 @@ function keyPattern(key: string): RegExp | undefined {
     const cp = c.codePointAt(0)!;
     const alts = [c.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&"), `\\\\u${cp.toString(16).padStart(4, "0")}`];
     alts.push(`%(?:25)*${cp.toString(16).padStart(2, "0")}`);
-    if (c === '"' || c === "\\" || c === "/") alts.push(`\\\\${alts[0]}`); // JSON short escapes
+    if (c === '"' || c === "/") alts.push(`\\\\${alts[0]}`); // JSON short escapes
     return `(?:${alts.join("|")})`;
   };
   const own = [...new Set(key)].filter((c) => !/[A-Za-z0-9]/.test(c)).map((c) => c.replace(/[\]\\^-]/g, "\\$&")).join("");
@@ -363,7 +367,7 @@ export class SamGovClient {
     private timeoutMs = DEFAULT_TIMEOUT_MS,
   ) {
     if (!apiKey) throw new SamGovError("SAM_API_KEY is not set. Get a free key at https://sam.gov (Account Details > API Key).", undefined, "MISSING_CONFIGURATION");
-    if (!VALID_KEY.test(apiKey)) throw new SamGovError("SAM_API_KEY must be 1 to 256 printable ASCII characters with no spaces or line breaks.", undefined, "MISSING_CONFIGURATION");
+    if (!VALID_KEY.test(apiKey)) throw new SamGovError("SAM_API_KEY must be 1 to 256 printable ASCII characters other than spaces, line breaks, % and \\.", undefined, "MISSING_CONFIGURATION");
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300_000) throw new SamGovError("timeoutMs must be an integer from 1 to 300000.");
     this.redact = redactor(apiKey);
   }

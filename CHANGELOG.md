@@ -32,7 +32,8 @@ is required; the exported `buildSearchUrl` rejects out-of-range `limit`/`offset`
   (the limit was 16, and combining marks, variation selectors and fillers were not separators; SAM-REA-01,
   OM-R2-SAM-01); the separator set excludes the key's own characters, so a key containing a space or punctuation no
   longer makes matching slow (OM-R2-SAM-02); the client refuses a key that is not 1 to 256 printable ASCII
-  characters without spaces, and no pattern is ever built from such a key, so an over-long key can no longer surface
+  characters other than spaces, `%` and `\` (a key with whitespace is refused rather than redacted, and `%` or `\`
+  in a key made matching ambiguous and, for long runs of backslashes, exponential; OM-R2C-SAM-01), and no pattern is ever built from such a key, so an over-long key can no longer surface
   in a RegExp error (OM-R2B-SAM-02); the README names `%`, `\` and the key's own punctuation as not recognized
   separators (OM-R2B-SAM-01); body cancellation is never awaited and body reads observe the request
   deadline, so a stalled transport cannot hold a result past the timeout (SAM-REA-02); at the page-index limit

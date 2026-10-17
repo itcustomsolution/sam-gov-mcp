@@ -214,8 +214,8 @@ describe("configuration, transport failures and key redaction", () => {
     expect(err.message).not.toContain(KEY);
   });
 
-  it("literal, percent-encoded (both hex cases), form-encoded and JSON-escaped keys are redacted everywhere", async () => {
-    const special = "SYNTH+key/with_punct=and\"quote\\0123";
+  it("literal, percent-encoded (both hex cases) and JSON-escaped keys are redacted everywhere", async () => {
+    const special = "SYNTH+key/with_punct=and\"quote0123";
     const forms = [special, encodeURIComponent(special), encodeURIComponent(special).replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase()), new URLSearchParams({ k: special }).toString().slice(2), JSON.stringify(special).slice(1, -1)];
     for (const f of forms) expect(redactKey(`echo ${f} end`, special)).toBe("echo REDACTED end");
     expect(redactKey("x?api_key%3Dabc%26y=1")).toBe("x?api_key%3DREDACTED%26y=1");
@@ -381,7 +381,7 @@ describe("independent re-audit (2026-10-17): redaction boundary, cleanup deadlin
   });
 
   it("OM-R2B-SAM-02: a key that is not 1-256 printable ASCII characters is refused and never echoed", async () => {
-    for (const bad of ["A1".repeat(2000), " " + SENTINEL, SENTINEL + "\n", "ABCD EFGH IJKL", "SYNTHETIC\u00e9KEY0123"]) {
+    for (const bad of ["A1".repeat(2000), " " + SENTINEL, SENTINEL + "\n", "ABCD EFGH IJKL", "SYNTHETIC\u00e9KEY0123", "SYNTHETIC%KEY0123", "SYNTHETIC\\KEY0123", "A" + "\\".repeat(30)]) {
       expect(() => new SamGovClient(bad)).toThrow(/printable ASCII/);
       try { new SamGovClient(bad); } catch (e: any) { expect(e.message).not.toContain(bad.trim()); expect(e.code).toBe("MISSING_CONFIGURATION"); }
       expect(redactKey("x?api_key=abc&y=1 echo", bad)).toBe("x?api_key=REDACTED&y=1 echo"); // no pattern is built, nothing throws
