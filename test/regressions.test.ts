@@ -618,3 +618,77 @@ describe("r3 review (omar, 2026-10-17): late-body cleanup, name/value splits, de
     expect(Object.keys(r).length).toBe(Object.keys(record).length);
   });
 });
+
+describe("r3 audit (2026-10-17): decoded redaction false negatives, short-key policy", () => {
+  const SENTINEL = "SYNTHETIC-SAM-SENTINEL-0123456789";
+  const CORE = SENTINEL.toLowerCase().replace(/[^a-z0-9]/g, "");
+  // The auditor's recovery helper (sam-r2-r3-probe.mjs), independent of the product's decoder: a plain projection,
+  // then format and control characters removed, complete numeric entities, \u escapes and percent-encoding undone.
+  const strip = (s: string) => s.normalize("NFKC").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const recoverable = (s: string) => {
+    if (strip(s).includes(CORE)) return true;
+    let t = s.replace(/[\p{Cf}\p{Cc}]/gu, "");
+    for (let i = 0; i < 4; i++) {
+      t = t.replace(/&#(?:x([0-9a-f]+)|([0-9]+));/gi, (_m, h, d) => String.fromCodePoint(h ? parseInt(h, 16) : Number(d)))
+        .replace(/\\u([0-9a-f]{4})/gi, (_m, h) => String.fromCharCode(parseInt(h, 16)));
+      try { t = decodeURIComponent(t); } catch { /* not percent-encoded */ }
+      if (strip(t).includes(CORE)) return true;
+    }
+    return false;
+  };
+  const outcome = (p: Promise<unknown>) => p.then((v) => JSON.stringify(v), (e) => `${e.code}: ${e.message}`);
+  const R = SENTINEL.slice(1);
+  const forms: [string, string][] = [
+    ["decimal entity padded to 8 digits", "&#00000083;" + R],
+    ["hex entity padded to 7 digits", "&#x0000053;" + R],
+    ["separator inside a percent escape", "%\u200b53" + R],
+    ["separator inside a JSON escape", "\\u\u200b0053" + R],
+    ["percent used as a separator before two hex digits", SENTINEL.replace("23", "%23")],
+  ];
+
+  it("R3-SAM-01: the auditor's five forms are not recoverable from values, property names, errors or redactKey", async () => {
+    for (const [kind, value] of forms) {
+      const full = await outcome(new SamGovClient(SENTINEL, reply(200, envelope([opp("n1", { title: value, [value]: "synthetic property" })])) as any).getOpportunity("n1"));
+      expect(recoverable(full), `notice ${kind}`).toBe(false);
+      const found = await outcome(new SamGovClient(SENTINEL, reply(200, envelope([opp("a1", { title: `see ${value} here` })])) as any).search(range));
+      expect(recoverable(found), `search ${kind}`).toBe(false);
+      const err: any = await new SamGovClient(SENTINEL, reply(502, `echo ${value}`) as any).search(range).catch((e) => e);
+      expect(err?.code, `error ${kind}`).toBeTruthy();
+      expect(recoverable(err.message), `error ${kind}`).toBe(false);
+      expect(recoverable(redactKey(value, SENTINEL)), `redactKey ${kind}`).toBe(false);
+    }
+  });
+
+  it("R3-SAM-01: a numeric entity beyond the Unicode range fails closed instead of decoding a prefix", () => {
+    for (const bad of ["&#99999999;", "&#x110000;", "&#x00000000110000;"]) expect(redactKey(`see ${bad} here`, SENTINEL), bad).toBe("REDACTED");
+    const text = "Synthetic notice &#38; &#x26; &#0000038; caf&#233;";
+    expect(redactKey(text, SENTINEL)).toBe(text); // in-range entities without the key are left alone
+    expect(redactKey("see &#99999999; here")).toBe("see &#99999999; here"); // no configured key, no check
+  });
+
+  it("R3-SAM-01: a percent gap split across neighbouring fields refuses the response", async () => {
+    const at = SENTINEL.indexOf("23") + 3;
+    const fields = { title: SENTINEL.replace("23", "%23").slice(0, at), solicitationNumber: SENTINEL.replace("23", "%23").slice(at) };
+    const ok = await outcome(new SamGovClient(SENTINEL, reply(200, envelope([opp("a1", fields)])) as any).search(range));
+    expect(ok.startsWith("INVALID_RESPONSE"), ok).toBe(true);
+    expect(recoverable(ok)).toBe(false);
+  });
+
+  it("R3-SAM-01 controls: the extra views stay linear and leave text without the key alone", () => {
+    for (const text of ["&#" + "0".repeat(200000) + "83;", ("%\u200b" + "41").repeat(60000), ("\\u\u200b" + "0041").repeat(40000), ("S" + "%2".repeat(3000) + "&#".repeat(2000)).repeat(40)]) {
+      const started = Date.now();
+      expect(redactKey(text, SENTINEL)).toBe(text);
+      expect(Date.now() - started).toBeLessThan(2000);
+    }
+    const interleaved = [...SENTINEL].join("x"); // documented: ASCII letters between the key's characters are text
+    expect(redactKey(interleaved, SENTINEL)).toBe(interleaved);
+  });
+
+  it("R3-SAM-02: a key shorter than 8 characters gets only api_key= masking, as documented", async () => {
+    const key = "SYN7KEY";
+    expect(redactKey(`x?api_key=${key}&y=1`, key)).toBe("x?api_key=REDACTED&y=1");
+    expect(redactKey(`echo ${key}`, key)).toBe(`echo ${key}`);
+    const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
+    expect(readme).toContain("keys shorter than 8 characters get only the `api_key=` value removed");
+  });
+});

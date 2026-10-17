@@ -229,40 +229,62 @@ const UTF8 = new TextDecoder("utf-8");
 
 export const MAX_DECODE_ROUNDS = 8;
 
+/** Characters an upstream might insert, even inside an escape: anything but letters, digits and the characters
+ * escapes are written with ("%", "\\", "&", "#", ";"), plus Hangul fillers. */
+const INSERTED = new RegExp(`[^\\p{L}\\p{N}%\\\\&#;]|[${INVISIBLE_LETTERS}]`, "gu");
+const fold = (t: string) => t.normalize("NFKC").toLowerCase().replace(/[^a-z0-9]/g, "");
+
 /**
- * The letters and digits of `s`, case-folded, after undoing the encodings an upstream might apply: percent-encoding
- * (repeated encoding of "%" collapsed), JSON \u escapes and HTML numeric entities, round after round until nothing
- * changes; named HTML entities are dropped, and NFKC folds compatibility forms such as fullwidth letters. Undefined
- * when the text still decodes further after MAX_DECODE_ROUNDS rounds, which the redactor treats as possibly the key.
- * Linear in `s`.
+ * The letters and digits of `s`, case-folded, in three views a key could be read from: as written (so "%" used as
+ * a separator before two hex digits cannot hide the key's own characters by decoding them); decoded; and decoded
+ * with inserted characters removed first, round after round (so an invisible character inside an escape cannot stop
+ * it decoding). Decoding undoes percent-encoding (repeated encoding of "%" collapsed), JSON \u escapes and HTML
+ * numeric entities, read whole however many leading zeros they carry, until nothing changes; named HTML entities are
+ * dropped, and NFKC folds compatibility forms such as fullwidth letters. Undefined when a view still decodes further
+ * after MAX_DECODE_ROUNDS rounds, or holds a numeric entity beyond U+10FFFF: the redactor treats either as possibly
+ * the key. Linear in `s`.
  */
-export function lettersAndDigits(s: string): string | undefined {
-  let t = s;
-  for (let round = 0; ; round++) {
-    const next = decodeOnce(t);
-    if (next === t) break;
-    if (round === MAX_DECODE_ROUNDS) return undefined;
-    t = next;
-  }
-  return t.normalize("NFKC").toLowerCase().replace(/[^a-z0-9]/g, "");
+export function keyViews(s: string): [string, string, string] | undefined {
+  const decoded = (strip: boolean): string | undefined => {
+    let t = strip ? s.replace(INSERTED, "") : s;
+    for (let round = 0; ; round++) {
+      let next = decodeOnce(t);
+      if (next === undefined) return undefined;
+      if (strip) next = next.replace(INSERTED, "");
+      if (next === t) return fold(t);
+      if (round === MAX_DECODE_ROUNDS) return undefined;
+      t = next;
+    }
+  };
+  const a = decoded(false), b = decoded(true);
+  return a === undefined || b === undefined ? undefined : [fold(s), a, b];
 }
 
-function decodeOnce(t: string): string {
-  return t.replace(/%(?:25)+(?=[0-9a-f]{2})/gi, "%")
+/** The decoded view of keyViews (kept for callers of r3). */
+export function lettersAndDigits(s: string): string | undefined {
+  return keyViews(s)?.[1];
+}
+
+function decodeOnce(t: string): string | undefined {
+  let outOfRange = false;
+  const out = t.replace(/%(?:25)+(?=[0-9a-f]{2})/gi, "%")
       .replace(/(?:%[0-9a-f]{2})+/gi, (run) => UTF8.decode(Uint8Array.from(run.slice(1).split("%"), (h) => parseInt(h, 16))))
       .replace(/\\u([0-9a-f]{4})/gi, (_m, h) => String.fromCharCode(parseInt(h, 16)))
-      .replace(/&#(?:x([0-9a-f]{1,6})|(\d{1,7}));?/gi, (_m, h, d) => {
-        const cp = h ? parseInt(h, 16) : Number(d);
-        return cp <= 0x10ffff ? String.fromCodePoint(cp) : "";
+      // The whole digit run: a bounded run would decode a prefix of "&#00000083;" and leave digits that hide a letter.
+      .replace(/&#(?:x0*([0-9a-f]+)|0*(\d+));?/gi, (_m, h, d) => {
+        const cp = h ? (h.length > 6 ? Infinity : parseInt(h, 16)) : (d.length > 7 ? Infinity : Number(d));
+        if (cp > 0x10ffff) { outOfRange = true; return ""; }
+        return String.fromCodePoint(cp);
       })
       .replace(/&[a-z][a-z0-9]{1,31};/gi, "");
+  return outOfRange ? undefined : out;
 }
 
 /**
- * Pattern redaction first (it keeps the rest of the text); then, fail-closed, any string whose decoded letters and
- * digits still contain the key's is replaced whole. `seen` receives the letters and digits of every result.
+ * Pattern redaction first (it keeps the rest of the text); then, fail-closed, any string in any of whose keyViews
+ * the key's letters and digits still appear is replaced whole. `seen` receives the three views of every result.
  */
-function redactor(key?: string, seen?: (lettersAndDigits: string) => void): (s: string) => string {
+function redactor(key?: string, seen?: (views: readonly string[]) => void): (s: string) => string {
   const pattern = key ? keyPattern(key) : undefined;
   const core = keyCore(key);
   return (s) => {
@@ -270,12 +292,12 @@ function redactor(key?: string, seen?: (lettersAndDigits: string) => void): (s: 
     const out = (pattern ? s.replace(pattern, "REDACTED") : s)
       .replace(/api_key=[^&\s"']+/gi, "api_key=REDACTED").replace(/api_key%3D(?:[^&%\s"']|%(?!26)[0-9a-f]{2})+/gi, "api_key%3DREDACTED");
     if (!core) return out;
-    const letters = lettersAndDigits(out);
-    if (letters === undefined || letters.includes(core)) {
-      seen?.("redacted");
+    const views = keyViews(out);
+    if (views === undefined || views.some((v) => v.includes(core))) {
+      seen?.(["redacted", "redacted", "redacted"]);
       return "REDACTED";
     }
-    seen?.(letters);
+    seen?.(views);
     return out;
   };
 }
@@ -301,14 +323,15 @@ export const MAX_ERROR_BODY_BYTES = 16 * 1024;
 
 /** Recursively redact every string (keys and values) in a parsed JSON value, within structure limits. */
 export function redactDeep<T>(value: T, key?: string): T {
-  // The letters and digits of every output string in output order, and separately of the values and of the property
-  // names: a key split across neighbouring fields (value and value, name and value, nested names) shows up only when
-  // they are read together.
-  let all = "";
-  let values = "";
-  let names = "";
-  const redact = redactor(key, (letters) => { values += letters; all += letters; });
-  const redactName = redactor(key, (letters) => { names += letters; all += letters; });
+  // Each of the three keyViews of every output string in output order, and separately of the values and of the
+  // property names: a key split across neighbouring fields (value and value, name and value, nested names) shows up
+  // only when they are read together.
+  const all = ["", "", ""];
+  const values = ["", "", ""];
+  const names = ["", "", ""];
+  const add = (into: string[], views: readonly string[]) => views.forEach((v, i) => { into[i] += v; all[i] += v; });
+  const redact = redactor(key, (views) => add(values, views));
+  const redactName = redactor(key, (views) => add(names, views));
   let nodes = 0;
   const visit = (v: unknown, depth: number): unknown => {
     if (++nodes > MAX_JSON_NODES || depth > MAX_JSON_DEPTH) throw new SamGovError("SAM.gov response exceeds JSON structure limits; narrow the search.", undefined, "INVALID_RESPONSE");
@@ -336,7 +359,7 @@ export function redactDeep<T>(value: T, key?: string): T {
   };
   const out = visit(value, 0) as T;
   const core = keyCore(key);
-  if (core && (all.includes(core) || values.includes(core) || names.includes(core)))
+  if (core && [all, values, names].some((joined) => joined.some((v) => v.includes(core))))
     throw new SamGovError("SAM.gov response appears to contain the API key split across fields; it was refused and none of it is returned.", undefined, "INVALID_RESPONSE");
   return out;
 }
