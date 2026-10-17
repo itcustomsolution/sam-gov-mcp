@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.2.0-rc.4] - unreleased candidate (2026-10-17, not published; 0.2.0-rc.1 of 2026-10-16, 0.2.0-rc.2 and 0.2.0-rc.3 of 2026-10-17 were the independently audited candidates)
+## [0.2.0-rc.5] - unreleased candidate (2026-10-17, not published; 0.2.0-rc.1 of 2026-10-16 and 0.2.0-rc.2 to 0.2.0-rc.4 of 2026-10-17 were the independently audited candidates)
 
 **Breaking:** malformed or mismatched SAM.gov responses are now tool errors; search results gain `pagination` and
 `source`; `get_opportunity` returns `{source, notice}`; tool errors are JSON objects with a `code`; Node 22 or later
@@ -62,3 +62,6 @@ is required; the exported `buildSearchUrl` rejects out-of-range `limit`/`offset`
   the automaton's state between neighbouring strings. Error excerpts are redacted before and after they are cut, so
   the cut cannot complete the key (OM-R4-SAM-02). README states the short-key policy exactly (R3-SAM-02) and lists
   what is still not recognized.
+- r4 audit fix (2026-10-17): an escape that one string leaves open and the next completes ("%5" then "3...") is read
+  across the boundary, so a key split that way across neighbouring fields refuses the response (R4-SAM-1). README
+  states that the recognized transformations are not protection against every encoding.
