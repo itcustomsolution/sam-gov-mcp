@@ -45,3 +45,9 @@ is required; the exported `buildSearchUrl` rejects out-of-range `limit`/`offset`
   letters and digits contain the key's is replaced whole, and a key split across neighbouring fields refuses the
   response, so `%`, `\`, the key's own punctuation, encoded separators, fullwidth letters and HTML entities no longer
   leave the key recoverable. `lettersAndDigits` and `markerLike` are exported.
+- r3 review fixes (omar, 2026-10-17): a late reply whose body has no working `cancel` no longer crashes the process
+  with an unhandled rejection (OM-R3-SAM-01, introduced by the R2-SAM-01 fix); a key split between a property name
+  and its value or across nested names refuses the response (OM-R3-SAM-02); decoding runs to a fixpoint and text that
+  still decodes after 8 rounds is blanked, so deeper nested encodings are covered (OM-R3-SAM-03); many property names
+  that redact to the same name are handled in linear time (OM-R3-SAM-04, pre-existing). `lettersAndDigits` returns
+  `undefined` for text that does not settle; `MAX_DECODE_ROUNDS` is exported.
