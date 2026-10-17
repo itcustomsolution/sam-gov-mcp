@@ -218,12 +218,54 @@ function keyPattern(key: string): RegExp | undefined {
   return new RegExp([...key].map(char).join(sep), "giu");
 }
 
-function redactor(key?: string): (s: string) => string {
+/** The key's letters and digits, case-folded, when there are enough of them to look for in decoded text. */
+function keyCore(key?: string): string | undefined {
+  if (!key || key.length < 8 || !VALID_KEY.test(key)) return undefined;
+  const k = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+  return k.length >= 8 ? k : undefined;
+}
+
+const UTF8 = new TextDecoder("utf-8");
+
+/**
+ * The letters and digits of `s`, case-folded, after undoing the encodings an upstream might apply: percent-encoding
+ * (repeated encoding of "%" collapsed), JSON \u escapes and HTML numeric entities, three rounds for nested forms;
+ * named HTML entities are dropped, and NFKC folds compatibility forms such as fullwidth letters. Linear in `s`.
+ */
+export function lettersAndDigits(s: string): string {
+  let t = s;
+  for (let round = 0; round < 3; round++) {
+    t = t.replace(/%(?:25)+(?=[0-9a-f]{2})/gi, "%")
+      .replace(/(?:%[0-9a-f]{2})+/gi, (run) => UTF8.decode(Uint8Array.from(run.slice(1).split("%"), (h) => parseInt(h, 16))))
+      .replace(/\\u([0-9a-f]{4})/gi, (_m, h) => String.fromCharCode(parseInt(h, 16)))
+      .replace(/&#(?:x([0-9a-f]{1,6})|(\d{1,7}));?/gi, (_m, h, d) => {
+        const cp = h ? parseInt(h, 16) : Number(d);
+        return cp <= 0x10ffff ? String.fromCodePoint(cp) : "";
+      })
+      .replace(/&[a-z][a-z0-9]{1,31};/gi, "");
+  }
+  return t.normalize("NFKC").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/**
+ * Pattern redaction first (it keeps the rest of the text); then, fail-closed, any string whose decoded letters and
+ * digits still contain the key's is replaced whole. `seen` receives the letters and digits of every result.
+ */
+function redactor(key?: string, seen?: (lettersAndDigits: string) => void): (s: string) => string {
   const pattern = key ? keyPattern(key) : undefined;
+  const core = keyCore(key);
   return (s) => {
     // The whole key first, so a parameter pattern cannot redact only its head.
-    const out = pattern ? s.replace(pattern, "REDACTED") : s;
-    return out.replace(/api_key=[^&\s"']+/gi, "api_key=REDACTED").replace(/api_key%3D(?:[^&%\s"']|%(?!26)[0-9a-f]{2})+/gi, "api_key%3DREDACTED");
+    const out = (pattern ? s.replace(pattern, "REDACTED") : s)
+      .replace(/api_key=[^&\s"']+/gi, "api_key=REDACTED").replace(/api_key%3D(?:[^&%\s"']|%(?!26)[0-9a-f]{2})+/gi, "api_key%3DREDACTED");
+    if (!core) return out;
+    const letters = lettersAndDigits(out);
+    if (letters.includes(core)) {
+      seen?.("redacted");
+      return "REDACTED";
+    }
+    seen?.(letters);
+    return out;
   };
 }
 
@@ -248,7 +290,12 @@ export const MAX_ERROR_BODY_BYTES = 16 * 1024;
 
 /** Recursively redact every string (keys and values) in a parsed JSON value, within structure limits. */
 export function redactDeep<T>(value: T, key?: string): T {
-  const redact = redactor(key);
+  // The letters and digits of every output value, and separately of every property name, in output order: a key
+  // split across neighbouring fields shows up only when they are read together.
+  let values = "";
+  let names = "";
+  const redact = redactor(key, (letters) => { values += letters; });
+  const redactName = redactor(key, (letters) => { names += letters; });
   let nodes = 0;
   const visit = (v: unknown, depth: number): unknown => {
     if (++nodes > MAX_JSON_NODES || depth > MAX_JSON_DEPTH) throw new SamGovError("SAM.gov response exceeds JSON structure limits; narrow the search.", undefined, "INVALID_RESPONSE");
@@ -258,8 +305,9 @@ export function redactDeep<T>(value: T, key?: string): T {
       const out: Record<string, unknown> = {};
       for (const [k, item] of Object.entries(v)) {
         // Two keys that redact to the same name both stay: the later one gets a numeric suffix.
-        let name = redact(k);
-        for (let n = 2; Object.prototype.hasOwnProperty.call(out, name); n++) name = `${redact(k)}_${n}`;
+        const base = redactName(k);
+        let name = base;
+        for (let n = 2; Object.prototype.hasOwnProperty.call(out, name); n++) name = `${base}_${n}`;
         // Define rather than assign so an upstream __proto__ key remains data.
         Object.defineProperty(out, name, { value: visit(item, depth + 1), enumerable: true, configurable: true, writable: true });
       }
@@ -267,7 +315,11 @@ export function redactDeep<T>(value: T, key?: string): T {
     }
     return v;
   };
-  return visit(value, 0) as T;
+  const out = visit(value, 0) as T;
+  const core = keyCore(key);
+  if (core && (values.includes(core) || names.includes(core)))
+    throw new SamGovError("SAM.gov response appears to contain the API key split across fields; it was refused and none of it is returned.", undefined, "INVALID_RESPONSE");
+  return out;
 }
 
 type Opportunity = Record<string, unknown> & { noticeId: string };

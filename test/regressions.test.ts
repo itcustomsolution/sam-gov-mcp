@@ -392,9 +392,10 @@ describe("independent re-audit (2026-10-17): redaction boundary, cleanup deadlin
     expect(JSON.stringify(out.body).length).toBeLessThan(2000);
   });
 
-  it("OM-R2B-SAM-01: percent, backslash and the key's own punctuation are not separators, as documented", () => {
-    // The README lists these as not recognized: each begins a key element, so it is left out of the separator set.
-    for (const sep of ["%", "\\", "-"]) expect(redactKey([...SENTINEL].join(sep), SENTINEL)).toBe([...SENTINEL].join(sep));
+  it("OM-R2B-SAM-01: percent, backslash and the key's own punctuation are not pattern separators", () => {
+    // Each begins a key element, so the pattern leaves them out of its separator set. Since the r2 audit the
+    // decoded-letters check replaces such a string whole (PREP-SAM-TRANSFORMED), so the key is still not returned.
+    for (const sep of ["%", "\\", "-"]) expect(redactKey([...SENTINEL].join(sep), SENTINEL)).toBe("REDACTED");
   });
 
   it("SAM-REA-01: matching stays fast on long runs of separator characters", async () => {
@@ -482,5 +483,54 @@ describe("r2 audit (2026-10-17): transport deadline, marker collision, transform
       expect(err.message).not.toContain(bad);
     }
     expect(() => new SamGovClient(SENTINEL)).not.toThrow();
+  });
+
+  const transformed: [string, string][] = [
+    ["own punctuation between characters", [...SENTINEL].join("-")],
+    ["percent between characters", [...SENTINEL].join("%")],
+    ["backslash between characters", [...SENTINEL].join("\\")],
+    ["encoded line break inside", SENTINEL.slice(0, 10) + "%0A" + SENTINEL.slice(10)],
+    ["encoded zero-width space inside", SENTINEL.slice(0, 10) + "%E2%80%8B" + SENTINEL.slice(10)],
+    ["escaped zero-width space inside", SENTINEL.slice(0, 10) + "\\u200b" + SENTINEL.slice(10)],
+    ["fullwidth letters", [...SENTINEL].map((c) => (/[!-~]/.test(c) ? String.fromCharCode(c.charCodeAt(0) + 0xfee0) : c)).join("")],
+    ["HTML decimal entities", [...SENTINEL].map((c) => `&#${c.charCodeAt(0)};`).join("")],
+    ["HTML hex entities with named separators", [...SENTINEL].map((c) => `&#x${c.charCodeAt(0).toString(16)};`).join("&nbsp;")],
+    ["upper and lower case mixed", [...SENTINEL].map((c, i) => (i % 2 ? c.toLowerCase() : c)).join("")],
+    ["percent-encoded twice with separators", [...SENTINEL].map((c) => "%25" + c.charCodeAt(0).toString(16)).join("%2520")],
+  ];
+
+  it("PREP-SAM-TRANSFORMED: transformed keys are not recoverable from results, property names or errors", async () => {
+    for (const [kind, value] of transformed) {
+      const ok = await outcome(new SamGovClient(SENTINEL, reply(200, envelope([opp("a1", { title: `see ${value} here` })])) as any).search(range));
+      expect(exposed(ok), `search ${kind}`).toBe(false);
+      const full = await outcome(new SamGovClient(SENTINEL, reply(200, envelope([opp("a1", { [value]: "x", description: value })])) as any).getOpportunity("a1"));
+      expect(exposed(full), `notice ${kind}`).toBe(false);
+      const err: any = await new SamGovClient(SENTINEL, reply(502, `echo ${value} end`) as any).search(range).catch((e) => e);
+      expect(exposed(err.message), `error ${kind}`).toBe(false);
+      expect(exposed(redactKey(value, SENTINEL)), `redactKey ${kind}`).toBe(false);
+    }
+  });
+
+  it("PREP-SAM-TRANSFORMED: a key split across neighbouring fields refuses the response", async () => {
+    const half = 15;
+    for (const fields of [{ title: SENTINEL.slice(0, half), solicitationNumber: SENTINEL.slice(half) },
+                          { title: `ref ${SENTINEL.slice(0, half)}`, solicitationNumber: `${SENTINEL.slice(half)} end` }]) {
+      const ok = await outcome(new SamGovClient(SENTINEL, reply(200, envelope([opp("a1", fields)])) as any).search(range));
+      expect(ok.startsWith("INVALID_RESPONSE"), ok).toBe(true);
+      expect(exposed(ok)).toBe(false);
+    }
+  });
+
+  it("PREP-SAM-TRANSFORMED controls: ordinary text, interleaved letters and short keys are left alone", async () => {
+    const text = "Synthetic notice: SYNTHETIC SAM 2026, sentinel review 0123.";
+    expect(redactKey(text, SENTINEL)).toBe(text);
+    const interleaved = [...SENTINEL].join("x"); // letters between the key's characters are text, documented
+    expect(redactKey(interleaved, SENTINEL)).toBe(interleaved);
+    const r = await new SamGovClient(SENTINEL, reply(200, envelope([opp("a1", { title: text })])) as any).search(range);
+    expect(r.results[0].title).toBe(text);
+    const big = ("S" + "%2".repeat(3000) + "&#".repeat(2000) + "\\u".repeat(2000)).repeat(40); // about 600,000 characters, no key
+    const started = Date.now();
+    expect(redactKey(big, SENTINEL)).toBe(big);
+    expect(Date.now() - started).toBeLessThan(2000);
   });
 });
