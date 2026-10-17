@@ -21,3 +21,9 @@ is required; the exported `buildSearchUrl` rejects out-of-range `limit`/`offset`
 - Key redaction also covers percent-, form- and JSON-escaped forms of the key and `api_key%3D` in links.
 - Input bounds: keyword (1000 characters) and notice ID (128) limits; JSON depth/size limits on returned records.
 - Lockfile regenerated: correct package name and MIT license metadata.
+- Independent review fixes: an empty or short page inside `totalRecords`, error-like fields, and undocumented
+  fields beside an empty page are `INVALID_RESPONSE`; `totalRecords` accepts a digit string like `limit`/`offset`;
+  key redaction matches a key wrapped across lines, split by control or invisible characters, re-encoded, or
+  JSON-escaped with `\u` or short escapes, and runs before excerpts are normalized and truncated; record keys
+  that redact to the same name are both kept; a timeout while reading the body is `TIMEOUT`; network error text is
+  labelled and sanitized; HTTP 404 after the first page reports `total: null`.

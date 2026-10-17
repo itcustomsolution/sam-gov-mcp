@@ -75,7 +75,8 @@ export interface Pagination {
 }
 
 export interface SearchResult {
-  total: number;
+  /** SAM.gov's totalRecords; null when a page after the first returned HTTP 404 (total unknown). */
+  total: number | null;
   results: OpportunitySummary[];
   pagination: Pagination;
   source: string;
@@ -179,21 +180,33 @@ export function summarize(o: any): OpportunitySummary {
   };
 }
 
-/** Every encoding of the key an upstream might echo: literal, percent/form-encoded (either hex case), JSON-escaped. */
-function keyForms(key: string): string[] {
-  const forms = new Set([key, encodeURIComponent(key), new URLSearchParams({ k: key }).toString().slice(2), JSON.stringify(key).slice(1, -1)]);
-  for (const f of [...forms]) forms.add(f.replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase()));
-  // ponytail: keys shorter than 8 characters are not plausible SAM keys; literal-substring redaction of them
-  // would corrupt ordinary text, so they are covered only by the api_key= parameter patterns below.
-  return [...forms].filter((f) => f.length >= 8).sort((a, b) => b.length - a.length);
+/**
+ * Matches the key however an upstream might echo it: each character literal, percent-encoded (either hex
+ * case, any number of times), form-encoded or JSON \u-escaped, with up to 16 whitespace, control or format
+ * characters between characters (a wrapped or NUL-split key). Case-insensitive, so a case variant of the key
+ * is also removed. Not covered: other encodings such as HTML entities or base64.
+ */
+function keyPattern(key: string): RegExp | undefined {
+  // ponytail: keys shorter than 8 characters are not plausible SAM keys; redacting them as substrings would
+  // corrupt ordinary text, so they are covered only by the api_key= parameter patterns below.
+  if ([...key].length < 8) return undefined;
+  const char = (c: string) => {
+    const cp = c.codePointAt(0)!;
+    const alts = [c.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&"), `\\\\u${cp.toString(16).padStart(4, "0")}`];
+    if (cp < 0x80) alts.push(`%(?:25)*${cp.toString(16).padStart(2, "0")}`);
+    if (c === " ") alts.push("\\+");
+    if (c === '"' || c === "\\" || c === "/") alts.push(`\\\\${alts[0]}`); // JSON short escapes
+    return `(?:${alts.join("|")})`;
+  };
+  return new RegExp([...key].map(char).join("[\\s\\p{Cc}\\p{Cf}]{0,16}"), "giu");
 }
 
 function redactor(key?: string): (s: string) => string {
-  const forms = key ? keyForms(key) : [];
+  const pattern = key ? keyPattern(key) : undefined;
   return (s) => {
-    let out = s.replace(/api_key=[^&\s"']+/gi, "api_key=REDACTED").replace(/api_key%3D[^&%\s"']+/gi, "api_key%3DREDACTED");
-    for (const f of forms) out = out.split(f).join("REDACTED");
-    return out;
+    // The whole key first, so a parameter pattern cannot redact only its head.
+    const out = pattern ? s.replace(pattern, "REDACTED") : s;
+    return out.replace(/api_key=[^&\s"']+/gi, "api_key=REDACTED").replace(/api_key%3D(?:[^&%\s"']|%(?!26)[0-9a-f]{2})+/gi, "api_key%3DREDACTED");
   };
 }
 
@@ -218,8 +231,11 @@ export function redactDeep<T>(value: T, key?: string): T {
     if (v && typeof v === "object") {
       const out: Record<string, unknown> = {};
       for (const [k, item] of Object.entries(v)) {
+        // Two keys that redact to the same name both stay: the later one gets a numeric suffix.
+        let name = redact(k);
+        for (let n = 2; Object.prototype.hasOwnProperty.call(out, name); n++) name = `${redact(k)}_${n}`;
         // Define rather than assign so an upstream __proto__ key remains data.
-        Object.defineProperty(out, redact(k), { value: visit(item, depth + 1), enumerable: true, configurable: true, writable: true });
+        Object.defineProperty(out, name, { value: visit(item, depth + 1), enumerable: true, configurable: true, writable: true });
       }
       return out;
     }
@@ -232,8 +248,10 @@ type Opportunity = Record<string, unknown> & { noticeId: string };
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
 const validNoticeId = (value: unknown): value is string => typeof value === "string" && value.length <= MAX_NOTICE_ID_LENGTH && /^[A-Za-z0-9-]+$/.test(value);
 const optionalText = (value: unknown) => value === undefined || value === null || (typeof value === "string" && value.length <= MAX_FIELD_LENGTH);
-/** GSA documents `limit`/`offset` in the response as numbers; a numeric string is tolerated. */
-const echoed = (value: unknown) => (typeof value === "number" ? value : typeof value === "string" && /^\d{1,9}$/.test(value) ? Number(value) : NaN);
+/** GSA documents `totalRecords`/`limit`/`offset` as numbers; a decimal-digit string is tolerated for all three. */
+const numeric = (value: unknown) => (typeof value === "number" ? value : typeof value === "string" && /^\d{1,15}$/.test(value) ? Number(value) : NaN);
+/** Top-level keys in GSA's documented success examples. */
+const ENVELOPE_KEYS = new Set(["totalRecords", "limit", "offset", "opportunitiesData", "links"]);
 const SUMMARY_FIELDS = ["solicitationNumber", "fullParentPathName", "postedDate", "responseDeadLine", "type", "typeOfSetAside", "naicsCode", "uiLink"];
 
 /**
@@ -244,15 +262,19 @@ const SUMMARY_FIELDS = ["solicitationNumber", "fullParentPathName", "postedDate"
 export function parseEnvelope(data: unknown, limit: number, offset: number): { total: number; list: Opportunity[] } {
   const invalid = (why: string) => new SamGovError(`SAM.gov returned an invalid opportunities response (${why}); no results can be trusted.`, undefined, "INVALID_RESPONSE");
   if (!record(data)) throw invalid("not a JSON object");
-  if (Object.keys(data).some((k) => /^(error|errors|errormessage|errorcode)$/i.test(k))) throw invalid("error envelope");
-  if (!Number.isSafeInteger(data.totalRecords) || (data.totalRecords as number) < 0) throw invalid("totalRecords is not a nonnegative integer");
   if (!Array.isArray(data.opportunitiesData)) throw invalid("opportunitiesData is not an array");
-  if (data.limit !== undefined && echoed(data.limit) !== limit) throw invalid("limit does not match the request");
-  if (data.offset !== undefined && echoed(data.offset) !== offset) throw invalid("offset does not match the request");
-  const total = data.totalRecords as number;
   const list = data.opportunitiesData;
+  // An error-like field, or any undocumented field beside an empty page, means this may be an error reply.
+  const extra = Object.keys(data).filter((k) => !ENVELOPE_KEYS.has(k));
+  if (extra.some((k) => /error|fault|message|status|warning/i.test(k)) || (extra.length > 0 && list.length === 0)) throw invalid("error envelope or unexpected fields");
+  const total = numeric(data.totalRecords);
+  if (!Number.isSafeInteger(total) || total < 0) throw invalid("totalRecords is not a nonnegative integer");
+  if (data.limit !== undefined && numeric(data.limit) !== limit) throw invalid("limit does not match the request");
+  if (data.offset !== undefined && numeric(data.offset) !== offset) throw invalid("offset does not match the request");
   if (list.length > limit) throw invalid("more records than the requested page size");
-  if (list.length > 0 && offset * limit + list.length > total) throw invalid("page is inconsistent with totalRecords");
+  // Every page before the last is full; the last holds the remainder. Short or empty in-range pages are not trusted.
+  const expected = Math.max(0, Math.min(limit, total - offset * limit));
+  if (list.length !== expected) throw invalid("page size is inconsistent with totalRecords");
   for (const o of list) {
     if (!record(o) || !validNoticeId(o.noticeId)) throw invalid("record without a valid noticeId");
     if (!optionalText(o.title) || SUMMARY_FIELDS.some((f) => !optionalText(o[f]))) throw invalid("record field has the wrong type");
@@ -295,11 +317,12 @@ export async function readCapped(body: ReadableStream<Uint8Array> | null, max: n
   }
 }
 
-/** Upstream error text is untrusted: redacted, control characters removed, truncated, and labelled. */
+/** Upstream or network error text is untrusted: redacted, then control/format/separator characters removed, truncated, labelled. */
 function excerpt(text: string, redact: (s: string) => string): string {
-  // eslint-disable-next-line no-control-regex
-  return `[untrusted upstream text] ${redact(text).replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ").slice(0, 300)}`;
+  return `[untrusted upstream text] ${redact(text).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, " ").slice(0, 300)}`;
 }
+
+const isTimeout = (e: unknown) => ["TimeoutError", "AbortError"].includes((e as Error)?.name);
 
 const NO_DATA = Symbol("no data");
 
@@ -323,9 +346,8 @@ export class SamGovClient {
       res = await this.fetchImpl(url, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(this.timeoutMs) });
     } catch (e) {
       // Network errors can carry the request URL (which contains the key); never pass them through raw.
-      const name = (e as Error)?.name;
-      if (name === "TimeoutError" || name === "AbortError") throw new SamGovError(`SAM.gov did not respond within ${this.timeoutMs} ms.`, undefined, "TIMEOUT");
-      throw new SamGovError(`Could not reach SAM.gov: ${this.redact(String((e as Error)?.message ?? e))}`, undefined, "NETWORK_ERROR");
+      if (isTimeout(e)) throw new SamGovError(`SAM.gov did not respond within ${this.timeoutMs} ms.`, undefined, "TIMEOUT");
+      throw new SamGovError(`Could not reach SAM.gov: ${excerpt(String((e as Error)?.message ?? e), this.redact)}`, undefined, "NETWORK_ERROR");
     }
     // Per the Get Opportunities API docs, HTTP 404 means "No Data found", not an error. Release the body.
     if (res.status === 404) {
@@ -346,7 +368,8 @@ export class SamGovClient {
       raw = await readCapped(res.body, MAX_RESPONSE_BYTES);
     } catch (e) {
       if (e instanceof ResponseTooLarge) throw new SamGovError("SAM.gov response too large; narrow the search.", undefined, "RESPONSE_TOO_LARGE");
-      throw new SamGovError(`Failed reading SAM.gov response: ${this.redact(String((e as Error)?.message ?? e))}`, undefined, "NETWORK_ERROR");
+      if (isTimeout(e)) throw new SamGovError(`SAM.gov did not finish responding within ${this.timeoutMs} ms.`, undefined, "TIMEOUT");
+      throw new SamGovError(`Failed reading SAM.gov response: ${excerpt(String((e as Error)?.message ?? e), this.redact)}`, undefined, "NETWORK_ERROR");
     }
     try {
       return JSON.parse(raw);
@@ -361,8 +384,9 @@ export class SamGovClient {
     const limit = p.limit ?? 10;
     const offset = p.offset ?? 0;
     const data = await this.get(url);
-    const { total, list } = data === NO_DATA ? { total: 0, list: [] } : parseEnvelope(data, limit, offset);
-    const hasMore = (offset + 1) * limit < total && offset < MAX_PAGE_INDEX;
+    // 404 is "no data": an empty result. After the first page it does not say how many records exist.
+    const { total, list } = data === NO_DATA ? { total: offset === 0 ? 0 : null, list: [] } : parseEnvelope(data, limit, offset);
+    const hasMore = total !== null && (offset + 1) * limit < total && offset < MAX_PAGE_INDEX;
     const pagination: Pagination = {
       page_index: offset,
       page_size: limit,

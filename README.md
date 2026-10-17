@@ -53,19 +53,26 @@ Per the GSA documentation, `offset` is a page index, not a record offset: page *
 *N* x `limit` to *N* x `limit` + `limit` - 1. Each search returns one page and never fetches more on its
 own. The result's `pagination` object says where you are: `page_index`, `page_size`, `returned_count`,
 `has_more`, `next_offset` (pass it back as `offset`, or `null` when there is no next page) and `partial`
-(true unless this single page holds every matching record). `total` is SAM.gov's `totalRecords`.
+(true unless this single page holds every matching record). `total` is SAM.gov's `totalRecords`; it is `null`
+when a page after the first returns HTTP 404, because that reply does not say how many records exist.
 
 ### Errors
 
 Tool errors are JSON: `{"error": {"code", "message", "status"?}}` with `isError: true`. Codes:
 `MISSING_CONFIGURATION`, `INVALID_INPUT`, `NETWORK_ERROR`, `TIMEOUT`, `UPSTREAM_HTTP_ERROR`,
-`RESPONSE_TOO_LARGE`, `INVALID_RESPONSE` (the body does not match the documented success format, including an
-error envelope sent with HTTP 200), `NOT_FOUND`, `AMBIGUOUS_RESULT` (more than one record for one notice ID)
-and `IDENTITY_MISMATCH` (a record for a different notice ID). HTTP 404 means "no data" per GSA and is an empty
-result; its body is released, not read.
+`RESPONSE_TOO_LARGE`, `INVALID_RESPONSE`, `NOT_FOUND`, `AMBIGUOUS_RESULT` (more than one record for one notice
+ID), `IDENTITY_MISMATCH` (a record for a different notice ID) and `INTERNAL_ERROR` (an unexpected failure inside
+this server). Arguments that fail the tool's input schema (for example `limit: 0`) are rejected by the MCP SDK
+before this server runs, as plain text, not JSON. HTTP 404 means "no data" per GSA and is an empty result; its
+body is released, not read.
 
-The format checks follow GSA's documented examples and this project's mocked tests. They have not been run
-against the live SAM.gov service in this release.
+`INVALID_RESPONSE` means the body does not match the documented success format: an error-like field (`error`,
+`message`, `status`, `fault`, `warning` in any form) or any undocumented top-level field beside an empty page,
+`totalRecords`/`limit`/`offset` that are not integers or do not match the request, a page that is not full
+before the last page or not the remainder on the last page, or a record without a valid `noticeId` or with a
+summary field of the wrong type. One malformed record fails the whole page. The checks follow GSA's documented
+examples and this project's mocked tests. They have not been run against the live SAM.gov service in this
+release, so a live reply that GSA formats differently may be refused.
 
 ## Scope and limits
 
@@ -76,9 +83,10 @@ against the live SAM.gov service in this release.
 
 ## Security notes
 
-- SAM.gov requires the key as an `api_key` query parameter, so it travels in the request URL to `api.sam.gov` over HTTPS. The server redacts it (literally and in percent-, form- and JSON-escaped forms, for keys of 8 or more characters) from errors, links, and returned JSON, but anything that logs full URLs (an HTTP proxy, for example) would see it.
+- SAM.gov requires the key as an `api_key` query parameter, so it travels in the request URL to `api.sam.gov` over HTTPS. The server removes it from errors, links and returned JSON: any `api_key=` value, and, for keys of 8 or more characters, the key itself written literally, percent-encoded (either hex case, also repeated), form-encoded or JSON-escaped, including when line breaks, control or invisible characters are inserted between its characters. Other encodings (HTML entities, base64) are not recognized. Anything that logs full URLs (an HTTP proxy, for example) would see the key.
 - Notice text, links and upstream error text are third-party content. Every result carries a `source` note saying
-  so, error excerpts are labelled `[untrusted upstream text]`, and both content tools say it in their
+  so, upstream and network error excerpts are labelled `[untrusted upstream text]` with control, bidirectional
+  and invisible formatting characters removed, and both content tools say it in their
   descriptions. Treat all of it as data, not instructions (prompt injection); this server does not and cannot
   make a model resistant to it.
 - Responses over 5 MB are refused and requests time out after 30 s.

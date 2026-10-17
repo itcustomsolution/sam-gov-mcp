@@ -256,3 +256,78 @@ describe("untrusted content and structure limits", () => {
     expect((await client.listTools()).tools.length).toBe(3);
   });
 });
+
+describe("independent review round (2026-10-16): residual envelope, redaction and transport gaps", () => {
+  it("SAM-R1: an empty or short page inside totalRecords is INVALID_RESPONSE; a page past the end may be empty", async () => {
+    expect(await code(new SamGovClient(KEY, reply(200, envelope([], 500)) as any).search(range))).toBe("INVALID_RESPONSE");
+    expect(await code(new SamGovClient(KEY, reply(200, envelope([opp("a1")], 500)) as any).search(range))).toBe("INVALID_RESPONSE");
+    const last = await new SamGovClient(KEY, reply(200, envelope([opp("a1"), opp("a2")], 12)) as any).search({ ...range, offset: 1 });
+    expect(last.results.length).toBe(2);
+    const past = await new SamGovClient(KEY, reply(200, envelope([], 12)) as any).search({ ...range, offset: 5 });
+    expect([past.results.length, past.pagination.has_more]).toEqual([0, false]);
+  });
+
+  it("SAM-R2: error-like fields, or any undocumented field beside an empty page, are INVALID_RESPONSE", async () => {
+    for (const extra of [{ error_message: "x" }, { message: "An invalid api_key was supplied", status: "error" }, { fault: { error: "x" } }, { somethingNew: 1 }]) {
+      expect(await code(new SamGovClient(KEY, reply(200, envelope([], 0, extra)) as any).search(range))).toBe("INVALID_RESPONSE");
+    }
+    expect(await code(new SamGovClient(KEY, reply(200, envelope([opp("a1")], 1, { statusCode: 200 })) as any).search(range))).toBe("INVALID_RESPONSE");
+    const ok = await new SamGovClient(KEY, reply(200, envelope([opp("a1")], 1, { links: [], somethingNew: 1 })) as any).search(range);
+    expect(ok.total).toBe(1);
+  });
+
+  it("SAM-R8: totalRecords, limit and offset all accept a decimal-digit string", async () => {
+    const r = await new SamGovClient(KEY, reply(200, { totalRecords: "1", limit: "10", offset: "0", opportunitiesData: [opp("a1")] }) as any).search(range);
+    expect(r.total).toBe(1);
+  });
+
+  it("SAM-R3: a key wrapped across lines, split by NUL or zero-width characters, or re-encoded is removed", async () => {
+    const pct = (s: string) => [...s].map((c) => "%" + c.charCodeAt(0).toString(16).padStart(2, "0")).join("");
+    const forms = [
+      `${KEY.slice(0, 20)}\r\n${KEY.slice(20)}`,
+      `${KEY.slice(0, 12)}\u0000${KEY.slice(12)}`,
+      `${KEY.slice(0, 10)}\u200b${KEY.slice(10)}`,
+      pct(KEY),
+      pct(KEY).toUpperCase(),
+      encodeURIComponent(pct(KEY)),
+      [...KEY].map((c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0").toUpperCase()).join(""),
+    ];
+    for (const f of forms) {
+      const err: any = await new SamGovClient(KEY, reply(502, `<pre>GET /x?api_key=${f}&y=1</pre> echo ${f}`) as any).search(range).catch((e) => e);
+      expect(err.code).toBe("UPSTREAM_HTTP_ERROR");
+      for (const part of [KEY.slice(0, 10), KEY.slice(12, 20), KEY.slice(-10)]) expect(err.message).not.toContain(part);
+    }
+    expect(redactKey("x?api_key%3Dab%2Bcd%26y=1")).toBe("x?api_key%3DREDACTED%26y=1");
+  });
+
+  it("SAM-R9: two record keys that redact to the same name are both kept", async () => {
+    const rec = opp("a1", { [KEY]: "one", [`${KEY.slice(0, 20)}%${KEY.charCodeAt(20).toString(16)}${KEY.slice(21)}`]: "two" });
+    const r: any = await new SamGovClient(KEY, reply(200, envelope([rec])) as any).getOpportunity("a1");
+    expect(Object.values(r).filter((v) => v === "one" || v === "two").sort()).toEqual(["one", "two"]);
+    expect(JSON.stringify(r)).not.toContain(KEY.slice(0, 20));
+  });
+
+  it("SAM-R4: a timeout while the body is being read is TIMEOUT", async () => {
+    const slow = (signal: AbortSignal) => new ReadableStream<Uint8Array>({
+      start(c) { c.enqueue(new TextEncoder().encode('{"totalRecords":')); },
+      pull(c) { return new Promise((_, reject) => signal.addEventListener("abort", () => { c.error(signal.reason); reject(signal.reason); })); },
+    });
+    const f = vi.fn(async (_u: string, init?: { signal?: AbortSignal }) => ({ ok: true, status: 200, body: slow(init!.signal!) }));
+    expect(await code(new SamGovClient(KEY, f as any, undefined, 50).search(range))).toBe("TIMEOUT");
+  });
+
+  it("SAM-R7: network error text is labelled untrusted and stripped of control, bidi and zero-width characters", async () => {
+    const f = vi.fn(async () => { throw new Error("connect failed \u001b[2J \u202e evil \u200b"); });
+    const err: any = await new SamGovClient(KEY, f as any).search(range).catch((e) => e);
+    expect(err.code).toBe("NETWORK_ERROR");
+    expect(err.message).toContain("[untrusted upstream text]");
+    expect(err.message).not.toMatch(/[\u001b\u202e\u200b]/);
+  });
+
+  it("SAM-R6: HTTP 404 after the first page reports total as unknown (null)", async () => {
+    const r = await new SamGovClient(KEY, (async () => ({ ok: false, status: 404, body: null })) as any).search({ ...range, offset: 5 });
+    expect([r.total, r.results.length, r.pagination.has_more, r.pagination.partial]).toEqual([null, 0, false, true]);
+    const first = await new SamGovClient(KEY, (async () => ({ ok: false, status: 404, body: null })) as any).search(range);
+    expect(first.total).toBe(0);
+  });
+});
