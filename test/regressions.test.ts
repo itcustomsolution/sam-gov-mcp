@@ -765,3 +765,25 @@ describe("r4 review (omar, 2026-10-17): mixed readings, excerpt cut, per-round N
     }
   });
 });
+
+describe("r4 review round 2 (omar, 2026-10-17): adjacent percent bytes, escaped escape characters", () => {
+  const K = "SYNTHETIC-SAM-SENTINEL-0123456789", R = K.slice(1);
+  const outcome = (p: Promise<unknown>) => p.then((v) => JSON.stringify(v), (e) => `${e.code}: ${e.message}`);
+
+  it("OM-R4B-SAM-01: one percent byte decoded beside another left as text is read, in every surface", async () => {
+    for (const value of [K.replace("56789", "%35%6789"), K.replace("23", "%2523"), "&amp;#83;" + R, "&#38;#83;" + R]) {
+      expect(redactKey(value, K), value).toBe("REDACTED");
+      const full = await outcome(new SamGovClient(K, reply(200, envelope([opp("n1", { title: value, [value]: "x" })])) as any).getOpportunity("n1"));
+      expect(full.includes(value), `notice ${value}`).toBe(false);
+      const err: any = await new SamGovClient(K, reply(502, `echo ${value}`) as any).search(range).catch((e) => e);
+      expect(err.message.includes(value), `error ${value}`).toBe(false);
+    }
+  });
+
+  it("OM-R4B-SAM controls: multi-byte UTF-8 and deeply nested ordinary text decode as before", () => {
+    const nestAmp = (s: string, n: number) => { for (let i = 0; i < n; i++) s = s.replace(/&/g, "&#38;"); return s; };
+    for (const n of [6, 7, 8]) expect(redactKey(nestAmp("Tom &amp; Jerry", n), K), `${n} layers`).toBe(nestAmp("Tom &amp; Jerry", n));
+    expect(redactKey("caf%C3%A9 %E2%80%8B %F0%9F%98%80 100%25", K)).toBe("caf%C3%A9 %E2%80%8B %F0%9F%98%80 100%25");
+    expect(redactKey(K.slice(0, 10) + "%E2%80%8B" + K.slice(10), K)).toBe("REDACTED"); // an encoded zero-width space inside
+  });
+});

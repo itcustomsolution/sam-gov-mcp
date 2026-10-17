@@ -230,36 +230,53 @@ const UTF8 = new TextDecoder("utf-8");
 export const MAX_DECODE_ROUNDS = 8;
 
 /**
- * One decoding step of each escape an upstream might write a key character in: a run of percent-encoded bytes (a
- * repeated encoding of "%" collapses), a JSON \u escape, an HTML numeric entity read whole however many leading zeros
- * it has, and a named HTML entity (dropped). Groups 1 and 2 are a numeric entity's hex and decimal digits.
+ * The escapes the scanner reads both ways, one decoding step each: a percent-encoded byte (a multi-byte UTF-8 sequence
+ * stays one token, so it decodes to its character), a JSON \u escape, an HTML numeric entity read whole however many
+ * leading zeros it has, and a named HTML entity. Each percent byte is its own token, so in "%35%67" either may be read
+ * as written while the other is decoded. Groups 1 and 2 are a numeric entity's hex and decimal digits.
  */
-const ESCAPE = /(?:%(?:25)*[0-9a-f]{2})+|\\u[0-9a-f]{4}|&#(?:x0*([0-9a-f]+)|0*(\d+));?|&[a-z][a-z0-9]{1,31};/gi;
+const ESCAPE = /%[c-f][0-9a-f](?:%[89ab][0-9a-f]){1,3}|%[0-9a-f]{2}|\\u[0-9a-f]{4}|&#(?:x0*([0-9a-f]+)|0*(\d+));?|&[a-z][a-z0-9]{1,31};/gi;
 /** Characters an upstream might insert, even inside an escape: after NFKC, anything but an ASCII letter or digit and
  * the characters escapes are written with ("%", "\\", "&", "#", ";"). */
 const INSERTED = /[^A-Za-z0-9%\\&#;]/g;
 const OUT_OF_RANGE = Symbol("numeric entity beyond U+10FFFF");
+/** Named entities for the characters escapes are written with, decoded so a doubly escaped key ("&amp;#83;") is read. */
+const NAMED: Record<string, string> = { amp: "&", num: "#", percnt: "%", bsol: "\\", semi: ";" };
+
+function named(tok: string): string {
+  const name = tok.slice(1, -1);
+  // The double-struck, script and fraktur letters ("&Sopf;") fold to a plain letter under NFKC once decoded.
+  if (/^[a-z](?:opf|scr|fr)$/i.test(name)) return name[0];
+  return NAMED[name.toLowerCase()] ?? "";
+}
 
 function decodeEscape(tok: string, hex?: string, dec?: string): string | typeof OUT_OF_RANGE {
-  if (tok[0] === "%") return UTF8.decode(Uint8Array.from(tok.slice(1).split("%"), (e) => parseInt(e.slice(-2), 16)));
+  if (tok[0] === "%") return UTF8.decode(Uint8Array.from(tok.slice(1).split("%"), (e) => parseInt(e, 16)));
   if (tok[0] === "\\") return String.fromCharCode(parseInt(tok.slice(2), 16));
-  // Named entities are dropped, except the double-struck, script and fraktur letters ("&Sopf;"), which NFKC folds to a
-  // plain letter once decoded.
-  if (tok[1] !== "#") return /^&[a-z](?:opf|scr|fr);$/i.test(tok) ? tok[1] : "";
+  if (tok[1] !== "#") return named(tok);
   // The whole digit run: a bounded run would decode a prefix of "&#00000083;" and leave digits that hide a letter.
   const cp = hex !== undefined ? (hex.length > 6 ? Infinity : parseInt(hex, 16)) : (dec!.length > 7 ? Infinity : Number(dec));
   return cp > 0x10ffff ? OUT_OF_RANGE : String.fromCodePoint(cp);
 }
 
-/** Decodes every escape in `t` once and applies NFKC; undefined when `t` holds a numeric entity beyond U+10FFFF. */
+/**
+ * One decoding round, in this order: repeated encoding of "%" collapsed, percent-encoding, JSON \u escapes, HTML
+ * numeric entities, then named entities; then NFKC. Undefined when `t` holds a numeric entity beyond U+10FFFF (unless
+ * `dropOutOfRange`, which drops it).
+ */
 function decodeOnce(t: string, dropOutOfRange = false): string | undefined {
   let bad = false;
-  const out = t.replace(ESCAPE, (tok: string, h?: string, d?: string) => {
-    const r = decodeEscape(tok, h, d);
-    if (r !== OUT_OF_RANGE) return r;
-    bad = true;
-    return "";
-  }).normalize("NFKC");
+  const out = t.replace(/%(?:25)+(?=[0-9a-f]{2})/gi, "%")
+    .replace(/(?:%[0-9a-f]{2})+/gi, (run) => UTF8.decode(Uint8Array.from(run.slice(1).split("%"), (h) => parseInt(h, 16))))
+    .replace(/\\u([0-9a-f]{4})/gi, (_m, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/&#(?:x0*([0-9a-f]+)|0*(\d+));?/gi, (tok: string, h?: string, d?: string) => {
+      const r = decodeEscape(tok, h, d);
+      if (r !== OUT_OF_RANGE) return r;
+      bad = true;
+      return "";
+    })
+    .replace(/&[a-z][a-z0-9]{1,31};/gi, named)
+    .normalize("NFKC");
   return bad && !dropOutOfRange ? undefined : out;
 }
 
