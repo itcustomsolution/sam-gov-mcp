@@ -5,6 +5,10 @@ An [MCP](https://modelcontextprotocol.io) server that lets AI assistants (Claude
 - **Read-only.** It only searches and reads public notices.
 - **Bring your own key.** You supply a free SAM.gov API key in `SAM_API_KEY`. The key is never logged and is redacted from errors and returned links.
 - **No ranking or scoring.** It returns what SAM.gov returns, summarized.
+- **Fails loudly.** A response that does not match the documented format, or a notice lookup that returns a
+  different or ambiguous record, is a tool error, never an empty or unrelated "success".
+
+Requires Node.js 22 or later.
 
 ## Quickstart
 
@@ -37,31 +41,57 @@ An [MCP](https://modelcontextprotocol.io) server that lets AI assistants (Claude
 
 | Tool | What it does | Inputs |
 |---|---|---|
-| `search_opportunities` | Search notices | `posted_from`, `posted_to` (optional, default last 30 days; YYYY-MM-DD or MM/DD/YYYY, max 1-year range), `keywords` (title), `naics`, `set_aside`, `state`, `limit` (1–100, default 10), `offset` |
-| `get_opportunity` | Full JSON for one notice | `notice_id` (looks back 1 year) |
+| `search_opportunities` | Search notices, one page per call | `posted_from`, `posted_to` (optional, default last 30 days; YYYY-MM-DD or MM/DD/YYYY, max 1-year range), `keywords` (title), `naics`, `set_aside`, `state`, `limit` (1-100 records per page, default 10), `offset` (zero-based **page index**, default 0) |
+| `get_opportunity` | The notice record for one notice, as the search API returns it | `notice_id` (looks back 1 year) |
 | `list_set_aside_codes` | Set-aside codes and meanings | none |
 
 Search results are summarized to: `noticeId`, `title`, `solicitationNumber`, `agency`, `postedDate`, `responseDeadline`, `type`, `setAside`, `naics`, `state`, `uiLink`.
 
+### Pages
+
+Per the GSA documentation, `offset` is a page index, not a record offset: page *N* holds records
+*N* x `limit` to *N* x `limit` + `limit` - 1. Each search returns one page and never fetches more on its
+own. The result's `pagination` object says where you are: `page_index`, `page_size`, `returned_count`,
+`has_more`, `next_offset` (pass it back as `offset`, or `null` when there is no next page) and `partial`
+(true unless this single page holds every matching record). `total` is SAM.gov's `totalRecords`.
+
+### Errors
+
+Tool errors are JSON: `{"error": {"code", "message", "status"?}}` with `isError: true`. Codes:
+`MISSING_CONFIGURATION`, `INVALID_INPUT`, `NETWORK_ERROR`, `TIMEOUT`, `UPSTREAM_HTTP_ERROR`,
+`RESPONSE_TOO_LARGE`, `INVALID_RESPONSE` (the body does not match the documented success format, including an
+error envelope sent with HTTP 200), `NOT_FOUND`, `AMBIGUOUS_RESULT` (more than one record for one notice ID)
+and `IDENTITY_MISMATCH` (a record for a different notice ID). HTTP 404 means "no data" per GSA and is an empty
+result; its body is released, not read.
+
+The format checks follow GSA's documented examples and this project's mocked tests. They have not been run
+against the live SAM.gov service in this release.
+
 ## Scope and limits
 
 - SAM.gov requires a posted-date range of 1 year or less on every search; the server validates this before calling the API.
-- Public API keys have daily rate limits set by GSA. Errors from SAM.gov are passed back as tool errors (with the key redacted).
+- Public API keys have daily rate limits set by GSA. This server does not rate-limit or queue calls itself; every
+  tool call is one SAM.gov request. Errors from SAM.gov are passed back as tool errors (with the key redacted).
 - Out of scope: entity/UEI lookup, award data, attachments download, bid/no-bid scoring.
 
 ## Security notes
 
-- SAM.gov requires the key as an `api_key` query parameter, so it travels in the request URL to `api.sam.gov` over HTTPS. The server redacts it from errors, links, and returned JSON, but anything that logs full URLs (an HTTP proxy, for example) would see it.
-- Notice titles and descriptions are third-party text. Treat them as data, not instructions (prompt injection).
+- SAM.gov requires the key as an `api_key` query parameter, so it travels in the request URL to `api.sam.gov` over HTTPS. The server redacts it (literally and in percent-, form- and JSON-escaped forms, for keys of 8 or more characters) from errors, links, and returned JSON, but anything that logs full URLs (an HTTP proxy, for example) would see it.
+- Notice text, links and upstream error text are third-party content. Every result carries a `source` note saying
+  so, error excerpts are labelled `[untrusted upstream text]`, and both content tools say it in their
+  descriptions. Treat all of it as data, not instructions (prompt injection); this server does not and cannot
+  make a model resistant to it.
 - Responses over 5 MB are refused and requests time out after 30 s.
 
 ## Development
 
 ```bash
-npm install
-npm test        # vitest, HTTP fully mocked, no key needed
+npm ci --ignore-scripts
 npm run build
+npm test        # vitest, HTTP fully mocked, no key needed
 ```
+
+Development needs Node.js 22.12 or later (Vitest 5).
 
 Never commit a real key. `.env` is git-ignored.
 

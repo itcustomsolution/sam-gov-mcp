@@ -102,10 +102,16 @@ describe("MCP server", () => {
 
 describe("HTTP 404 from SAM.gov", () => {
   it("is treated as no results, not an error", async () => {
-    const f = async () => ({ ok: false, status: 404, body: streamOf("") });
+    // Shape note (0.2.0): results now also carry pagination and source (SAM-04); the zero-result
+    // contract below is unchanged. The body must be cancelled, not abandoned (SAM-03).
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({ pull(c) { c.enqueue(new TextEncoder().encode("{}")); }, cancel() { cancelled = true; } }, { highWaterMark: 0 });
+    const f = async () => ({ ok: false, status: 404, body });
     const c = new SamGovClient("k", f as any);
     const r = await c.search({ postedFrom: "2026-09-01", postedTo: "2026-10-01" } as any);
-    expect(r).toEqual({ total: 0, results: [] });
+    expect(r).toMatchObject({ total: 0, results: [] });
+    expect(r.pagination).toMatchObject({ returned_count: 0, has_more: false, next_offset: null, partial: false });
+    expect(cancelled).toBe(true);
   });
 });
 
