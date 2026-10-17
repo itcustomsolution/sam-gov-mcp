@@ -473,4 +473,14 @@ describe("r2 audit (2026-10-17): transport deadline, marker collision, transform
       expect(bodyCancelled, "the late body is released").toBe(true);
     }
   });
+
+  it("R2-SAM-02: a key that could be confused with the redaction marker is refused and never echoed", () => {
+    for (const bad of ["REDACTED", "redacted", "Re-Dac-Ted", "XREDACTEDX1", "api_key=REDACTED", "apikeyredacted"]) {
+      let err: any;
+      try { new SamGovClient(bad); } catch (e) { err = e; }
+      expect(err?.code, bad).toBe("MISSING_CONFIGURATION");
+      expect(err.message).not.toContain(bad);
+    }
+    expect(() => new SamGovClient(SENTINEL)).not.toThrow();
+  });
 });

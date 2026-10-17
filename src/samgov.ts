@@ -227,6 +227,15 @@ function redactor(key?: string): (s: string) => string {
   };
 }
 
+/**
+ * True when redacted output could equal or contain the key: its letters and digits (8 or more) contain "redacted" or
+ * occur inside a marker. Such a key is refused, so "REDACTED" in a result never means the key itself.
+ */
+export function markerLike(key: string): boolean {
+  const k = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+  return k.length >= 8 && (k.includes("redacted") || ["apikeyredacted", "apikey3dredacted"].some((m) => m.includes(k)));
+}
+
 /** Removes the api_key query value, and the literal or encoded key, from any string. */
 export function redactKey(s: string, key?: string): string {
   return redactor(key)(s);
@@ -374,6 +383,7 @@ export class SamGovClient {
   ) {
     if (!apiKey) throw new SamGovError("SAM_API_KEY is not set. Get a free key at https://sam.gov (Account Details > API Key).", undefined, "MISSING_CONFIGURATION");
     if (!VALID_KEY.test(apiKey)) throw new SamGovError("SAM_API_KEY must be 1 to 256 printable ASCII characters other than spaces, line breaks, % and \\.", undefined, "MISSING_CONFIGURATION");
+    if (markerLike(apiKey)) throw new SamGovError("SAM_API_KEY looks like this server's redaction marker; use the key issued by SAM.gov.", undefined, "MISSING_CONFIGURATION");
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300_000) throw new SamGovError("timeoutMs must be an integer from 1 to 300000.");
     this.redact = redactor(apiKey);
   }
