@@ -183,35 +183,34 @@ export function summarize(o: any): OpportunitySummary {
 }
 
 /** Hangul fillers render as nothing but are letters, so the letter exclusion in keyPattern would keep them. */
-const INVISIBLE_LETTERS = ["\u115f", "\u1160", "\u3164", "\uffa0"];
+const INVISIBLE_LETTERS = "\u115f\u1160\u3164\uffa0";
+/** SAM keys are 40 printable ASCII characters; anything else is a misconfiguration and is refused, never echoed. */
+export const VALID_KEY = /^[\x21-\x7e]{1,256}$/;
 
 /**
  * Matches the key however an upstream might echo it: each character literal, percent-encoded (either hex
- * case, any number of times), form-encoded or JSON \u-escaped, with any number of separators between characters.
- * A separator is any character that is not a letter or digit (whitespace, punctuation, control, format, combining
- * and other invisible characters), or a Hangul filler, except the characters that can begin a key character in
- * one of those forms: the key's own characters, "%", "\\" and, for a key containing a space, "+". Case-insensitive,
- * so a case variant of the key is also removed. Not covered: a separator inside an encoded character or itself
+ * case, any number of times) or JSON \u-escaped, with any number of separators between characters. A separator is
+ * any character that is not a letter or digit (under case folding), not "%" or "\\", and not one of the key's own
+ * characters; Hangul fillers are separators too. "%" and "\\" begin an encoded key character, so excluding them and
+ * the key's own characters keeps the separator set disjoint from every key element by construction, and matching
+ * stays linear in the text length. Case-insensitive, so a case variant of the key is also removed. Not covered:
+ * "%", "\\" or the key's own punctuation used as separators, a separator inside an encoded character or itself
  * encoded, letters or digits used as separators, look-alike characters, a key split across separate strings, and
- * other encodings such as HTML entities or base64. The separator set is disjoint from every key element by
- * construction, so matching stays linear in the text length.
+ * other encodings such as HTML entities or base64. Only a valid key (VALID_KEY) gets a pattern.
  */
 function keyPattern(key: string): RegExp | undefined {
   // ponytail: keys shorter than 8 characters are not plausible SAM keys; redacting them as substrings would
   // corrupt ordinary text, so they are covered only by the api_key= parameter patterns below.
-  if ([...key].length < 8) return undefined;
+  if (key.length < 8 || !VALID_KEY.test(key)) return undefined;
   const char = (c: string) => {
     const cp = c.codePointAt(0)!;
     const alts = [c.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&"), `\\\\u${cp.toString(16).padStart(4, "0")}`];
-    if (cp < 0x80) alts.push(`%(?:25)*${cp.toString(16).padStart(2, "0")}`);
-    if (c === " ") alts.push("\\+");
+    alts.push(`%(?:25)*${cp.toString(16).padStart(2, "0")}`);
     if (c === '"' || c === "\\" || c === "/") alts.push(`\\\\${alts[0]}`); // JSON short escapes
     return `(?:${alts.join("|")})`;
   };
-  const chars = new Set(key);
-  const own = [...chars].filter((c) => !/[\p{L}\p{N}]/u.test(c)).map((c) => c.replace(/[\]\\^-]/g, "\\$&")).join("");
-  const fillers = INVISIBLE_LETTERS.filter((c) => !chars.has(c)).join("");
-  const sep = `(?:[^\\p{L}\\p{N}%\\\\${chars.has(" ") ? "+" : ""}${own}]${fillers ? `|[${fillers}]` : ""})*`;
+  const own = [...new Set(key)].filter((c) => !/[A-Za-z0-9]/.test(c)).map((c) => c.replace(/[\]\\^-]/g, "\\$&")).join("");
+  const sep = `(?:[^\\p{L}\\p{N}%\\\\${own}]|[${INVISIBLE_LETTERS}])*`;
   return new RegExp([...key].map(char).join(sep), "giu");
 }
 
@@ -364,6 +363,7 @@ export class SamGovClient {
     private timeoutMs = DEFAULT_TIMEOUT_MS,
   ) {
     if (!apiKey) throw new SamGovError("SAM_API_KEY is not set. Get a free key at https://sam.gov (Account Details > API Key).", undefined, "MISSING_CONFIGURATION");
+    if (!VALID_KEY.test(apiKey)) throw new SamGovError("SAM_API_KEY must be 1 to 256 printable ASCII characters with no spaces or line breaks.", undefined, "MISSING_CONFIGURATION");
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300_000) throw new SamGovError("timeoutMs must be an integer from 1 to 300000.");
     this.redact = redactor(apiKey);
   }

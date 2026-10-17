@@ -215,7 +215,7 @@ describe("configuration, transport failures and key redaction", () => {
   });
 
   it("literal, percent-encoded (both hex cases), form-encoded and JSON-escaped keys are redacted everywhere", async () => {
-    const special = "SYNTH+key/with space=and\"quote\\0123";
+    const special = "SYNTH+key/with_punct=and\"quote\\0123";
     const forms = [special, encodeURIComponent(special), encodeURIComponent(special).replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase()), new URLSearchParams({ k: special }).toString().slice(2), JSON.stringify(special).slice(1, -1)];
     for (const f of forms) expect(redactKey(`echo ${f} end`, special)).toBe("echo REDACTED end");
     expect(redactKey("x?api_key%3Dabc%26y=1")).toBe("x?api_key%3DREDACTED%26y=1");
@@ -370,14 +370,31 @@ describe("independent re-audit (2026-10-17): redaction boundary, cleanup deadlin
     expect(redactKey(interleaved, SENTINEL)).toBe(interleaved);
   });
 
-  it("OM-R2-SAM-02: a key containing a space or punctuation does not make matching slow", async () => {
-    for (const key of [" " + SENTINEL, "ABCD EFGH IJKL", "ABCD-EFGH.IJKL"]) {
+  it("OM-R2-SAM-02: a key containing punctuation does not make matching slow", async () => {
+    for (const key of ["-" + SENTINEL, "ABCD.EFGH.IJKL", "ABCD-EFGH.IJKL"]) {
       const text = (key[0] + " ".repeat(8000)).repeat(60); // about 480,000 characters
       const started = Date.now();
       redactKey(text, key);
       expect(Date.now() - started, JSON.stringify(key)).toBeLessThan(2000);
       expect(redactKey(`x${key}x`, key)).toBe("xREDACTEDx");
     }
+  });
+
+  it("OM-R2B-SAM-02: a key that is not 1-256 printable ASCII characters is refused and never echoed", async () => {
+    for (const bad of ["A1".repeat(2000), " " + SENTINEL, SENTINEL + "\n", "ABCD EFGH IJKL", "SYNTHETIC\u00e9KEY0123"]) {
+      expect(() => new SamGovClient(bad)).toThrow(/printable ASCII/);
+      try { new SamGovClient(bad); } catch (e: any) { expect(e.message).not.toContain(bad.trim()); expect(e.code).toBe("MISSING_CONFIGURATION"); }
+      expect(redactKey("x?api_key=abc&y=1 echo", bad)).toBe("x?api_key=REDACTED&y=1 echo"); // no pattern is built, nothing throws
+    }
+    const { call } = await mcp(reply(200, envelope([])), "A1".repeat(2000));
+    const out = await call("search_opportunities", { posted_from: "2026-01-01", posted_to: "2026-01-31" });
+    expect(JSON.stringify(out.body)).not.toContain("A1A1A1A1");
+    expect(JSON.stringify(out.body).length).toBeLessThan(2000);
+  });
+
+  it("OM-R2B-SAM-01: percent, backslash and the key's own punctuation are not separators, as documented", () => {
+    // The README lists these as not recognized: each begins a key element, so it is left out of the separator set.
+    for (const sep of ["%", "\\", "-"]) expect(redactKey([...SENTINEL].join(sep), SENTINEL)).toBe([...SENTINEL].join(sep));
   });
 
   it("SAM-REA-01: matching stays fast on long runs of separator characters", async () => {
