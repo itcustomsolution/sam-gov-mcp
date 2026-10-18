@@ -15,10 +15,16 @@
 - Internal security review fixes (round 1): a key written with control characters for letters (shown as `\b`, `\f`
   in the output) is caught (also present in rc.5); network error text is cut to 16 KB before it is redacted in the main thread; each string costs a fixed 16
   units; at most 2 checks run at once.
-- Internal security review fixes (round 2): the scan decomposes text (NFKD) so a combining mark after a letter no
-  longer hides it (also in rc.5); a control character or lone surrogate is read in the same pass both as a separator
+- Internal security review fixes (round 2): the scan reads letters after decomposition (NFKD) so a combining mark
+  after a letter no longer hides it (also in rc.5; completed in the review of the final delta); a control character or lone surrogate is read in the same pass both as a separator
   and as the letters JSON writes for it, replacing round 1's second scan and its extra cost; a record with an
   integer-like property name is also read in JSON's output order; a check's slot is held until its thread exits.
+- Internal security review of the final delta: the reading with inserted characters removed deleted control
+  characters before they could be read as JSON escape letters (927 of 3,000 fuzzed strings that 4256cfb caught were
+  returned); a third reading keeps them. NFKC no longer merges a combining mark into an escape's last digit in the
+  stripped readings. The output-order reading covers values alone and names alone. On a 3,000-string differential fuzz
+  nothing 4256cfb caught is lost; on 3,600 encoded-key inputs 3,439 results equal rc.5's and 161 redact more, none is
+  refused. Newline-separated lists of percent-encoded URLs now exceed the default budget and are refused.
 - `server.json` (MCP registry metadata) had stayed at 0.2.0-rc.2 through rc.3 to rc.5; it now matches the package
   version, and a test keeps them equal.
 - Previously measured (r5, crafted 5 MB replies): about 10 s of CPU or about 1 GB of memory. Those shapes, scaled to

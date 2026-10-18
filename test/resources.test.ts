@@ -236,3 +236,30 @@ describe("R6 review round 2 (omar): combining marks, output order, thread count"
     expect(live).toBe(0);
   });
 });
+
+describe("R6 review of the final delta (omar): stripped readings keep control letters, marks never merge into escapes", () => {
+  const ch = (n: number) => String.fromCharCode(n);
+  const zw = ch(0x200b), acute = ch(0x301);
+  it("OM-R6C-01: an escape broken by an inserted character beside a control character sent for a key letter", async () => {
+    const bad = "%5" + zw + "3YNTHETIC-sentinel-key-0123456789a" + ch(8) + "cdef";
+    expect((await new SamGovClient(KEY, reply(notice({ x: bad }))).getOpportunity("n1"))?.x).toBe("REDACTED");
+  });
+
+  it("OM-R6C-02: a combining mark after an escape's last digit does not stop it decoding", async () => {
+    for (const bad of ["SY%4e" + acute + "THETIC-sentinel-key-0123456789abcdef", "%5" + zw + "3YNTHETIC-se" + acute + "ntinel-key-0123456789abcdef"]) {
+      expect((await new SamGovClient(KEY, reply(notice({ x: bad }))).getOpportunity("n1"))?.x, JSON.stringify(bad)).toBe("REDACTED");
+    }
+  });
+
+  it("OM-R6C-02 control: a precomposed letter used as a separator, also inside an escape, is still removed", () => {
+    for (const bad of [[...KEY].join(ch(0xe9)), "%" + ch(0xe9) + "53YNTHETIC-sentinel-key-0123456789abcdef"]) {
+      expect(redactDeep({ x: bad }, KEY).x, JSON.stringify(bad)).toBe("REDACTED");
+    }
+  });
+
+  it("OM-R6C-03: in JSON's output order, the values alone are read too", async () => {
+    const digits = "1234567890";
+    const e = await err(new SamGovClient(digits, reply({ totalRecords: 1, opportunitiesData: [{ noticeId: "n1", "1": "12345", [digits]: "x", "2000000000": "67890" }] })).getOpportunity("n1"));
+    expect(e?.code).toBe("INVALID_RESPONSE");
+  });
+});

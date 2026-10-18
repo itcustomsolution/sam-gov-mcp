@@ -266,6 +266,8 @@ const ESCAPE = /%[c-f][0-9a-f](?:%[89ab][0-9a-f]){1,3}|%[0-9a-f]{2}|\\u[0-9a-f]{
 /** Characters an upstream might insert, even inside an escape: after NFKC, anything but an ASCII letter or digit and
  * the characters escapes are written with ("%", "\\", "&", "#", ";"). */
 const INSERTED = /[^A-Za-z0-9%\\&#;]/g;
+const MARKS = /\p{M}/gu, NO_MATCH = /(?!)/g;
+const INSERTED_EXCEPT_CONTROL = /[^A-Za-z0-9%\\&#;\x00-\x1f]/g;
 const OUT_OF_RANGE = Symbol("numeric entity beyond U+10FFFF");
 /** The letters JSON writes for a control character that has a short escape; the others are written as \u00XX. */
 const JSON_ESCAPE: Record<number, string> = { 8: "b", 9: "t", 10: "n", 12: "f", 13: "r" };
@@ -293,7 +295,7 @@ function decodeEscape(tok: string, hex?: string, dec?: string): string | typeof 
  * numeric entities, then named entities; then NFKC. Undefined when `t` holds a numeric entity beyond U+10FFFF (unless
  * `dropOutOfRange`, which drops it).
  */
-function decodeOnce(t: string, dropOutOfRange = false): string | undefined {
+function decodeOnce(t: string, dropOutOfRange = false, marks = false): string | undefined {
   let bad = false;
   const out = t.replace(/%(?:25)+(?=[0-9a-f]{2})/gi, "%")
     .replace(/(?:%[0-9a-f]{2})+/gi, (run) => UTF8.decode(Uint8Array.from(run.slice(1).split("%"), (h) => parseInt(h, 16))))
@@ -305,11 +307,12 @@ function decodeOnce(t: string, dropOutOfRange = false): string | undefined {
       return "";
     })
     .replace(/&[a-z][a-z0-9]{1,31};/gi, named)
+    .replace(marks ? MARKS : NO_MATCH, "") // stripped readings: a combining mark is an inserted character, removed before NFKC can merge it into a letter
     .normalize("NFKC");
   return bad && !dropOutOfRange ? undefined : out;
 }
 
-const fold = (t: string) => t.normalize("NFKD").toLowerCase().replace(/[^a-z0-9]/g, "");
+const fold = (t: string) => t.normalize("NFKC").toLowerCase().replace(/[^a-z0-9]/g, "");
 
 /**
  * The letters and digits of `s`, case-folded, after decoding every escape round after round until nothing changes.
@@ -404,19 +407,26 @@ function keyScanner(core: string, joined = false, budget?: Budget): Scanner {
     // Every reading is bounded before it is made: NFKC or a decoding round that lengthens the text past the growth
     // limit refuses the reply, so no transient copy is larger than that limit.
     const limit = growthLimit(budget, s.length);
-    for (const strip of [false, true]) {
+    // Three readings: as written; with inserted characters removed (control characters count as inserted); and, where the
+    // string has a control character, with the others removed but control characters kept, so that one sent for a key
+    // letter is still read as JSON writes it beside an escape that inserted characters broke up.
+    const modes: (RegExp | null)[] = /[\x00-\x1f]/.test(s) ? [null, INSERTED, INSERTED_EXCEPT_CONTROL] : [null, INSERTED];
+    for (const removed of modes) {
+      const strip = removed !== null;
       // With inserted characters removed, an out-of-range entity may be joined up from ordinary text ("Fax & #: 202..."),
       // so it is dropped there rather than treated as possibly the key.
       spend(budget, s.length);
-      let t = strip ? s.normalize("NFKC").replace(INSERTED, "") : s.normalize("NFKC");
+      // In the stripped readings, combining marks are removed before NFKC, so "%4e" plus U+0301 still decodes and a letter
+      // followed by a mark is still that letter; a precomposed letter ("é") stays one character, which is then removed.
+      let t = removed ? s.replace(MARKS, "").normalize("NFKC").replace(removed, "") : s.normalize("NFKC");
       if (t.length > limit) throw tooComplex("grows too much when normalized to be checked for the API key");
       for (let round = 0; ; round++) {
         hit = scanRound(t, start, end) || hit;
         spend(budget, t.length);
-        let next = decodeOnce(t, strip || joined);
+        let next = decodeOnce(t, strip || joined, strip);
         if (next !== undefined && next.length > limit) throw tooComplex("grows too much when decoded to be checked for the API key");
         if (next === undefined) return { hit: true, end };
-        if (strip) next = next.replace(INSERTED, "");
+        if (removed) next = next.replace(removed, "");
         if (next === t) break;
         if (round === MAX_DECODE_ROUNDS) return { hit: true, end };
         t = next;
@@ -565,8 +575,17 @@ export function redactDeep<T>(value: T, key?: string, limits: Partial<CheckLimit
       throw new SamGovError("SAM.gov response appears to contain the API key split across fields; it was refused and none of it is returned.", undefined, "INVALID_RESPONSE");
     // JSON writes integer-like property names first, so where there is one the output's order can differ from the
     // input's: the result is then also read once as it will be written.
-    if (reordered && joined(JSON.stringify(result) ?? "").hit)
-      throw new SamGovError("SAM.gov response appears to contain the API key split across fields; it was refused and none of it is returned.", undefined, "INVALID_RESPONSE");
+    if (reordered) {
+      const outAll: string[] = [], outValues: string[] = [], outNames: string[] = [];
+      const walk = (v: unknown): void => { // Object.entries gives JSON.stringify's order
+        if (typeof v === "string") { outAll.push(v); outValues.push(v); }
+        else if (Array.isArray(v)) v.forEach(walk);
+        else if (v && typeof v === "object") for (const [k, item] of Object.entries(v)) { outAll.push(k); outNames.push(k); walk(item); }
+      };
+      walk(result);
+      if ([outAll, outValues, outNames].some((parts) => parts.length > 1 && joined(parts.join("")).hit))
+        throw new SamGovError("SAM.gov response appears to contain the API key split across fields; it was refused and none of it is returned.", undefined, "INVALID_RESPONSE");
+    }
   }
   return result;
 }
