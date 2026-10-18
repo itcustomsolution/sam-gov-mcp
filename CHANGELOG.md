@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.2.0-rc.6] - unreleased candidate (2026-10-18, not published; 0.2.0-rc.5 and earlier were audited and are frozen)
+
+- R5-SAM-RES: checking a reply for the API key is bounded and stoppable. Everything after the body is read
+  (JSON parsing, format checks, transformation-aware redaction) runs in a worker thread with a 256 MB heap limit
+  that is terminated at the call's deadline or on cancellation; the deadline now covers the whole call. Before the
+  check, each string's NFKC growth is limited (4 times plus 256, all strings 2 times plus 65,536); the check itself
+  has a deterministic work budget (48 units per character plus 1,000,000; 32 per escape). Exceeding a limit is the
+  new `RESPONSE_TOO_COMPLEX`; nothing of the reply is returned. Redaction coverage is unchanged.
+- Cancellation: `search` and `getOpportunity` take `{ signal }`, the MCP tools pass the client's cancellation, and
+  a cancelled call is the new `CANCELLED`.
+- `SamGovClient` takes a fifth argument `{ limits, workerUrl }`; `redactDeep` takes `limits`; `checkReply` and
+  `CHECK_LIMITS` are exported.
+- `server.json` (MCP registry metadata) had stayed at 0.2.0-rc.2 through rc.3 to rc.5; it now matches the package
+  version, and a test keeps them equal.
+- Previously measured (r5, crafted 5 MB replies): about 10 s of CPU or about 1 GB of memory. Those shapes, scaled to
+  64 to 256 KB, are now refused within the budget; no 5 MB measurement was made for this candidate.
+
 ## [0.2.0-rc.5] - unreleased candidate (2026-10-17, not published; 0.2.0-rc.1 of 2026-10-16 and 0.2.0-rc.2 to 0.2.0-rc.4 of 2026-10-17 were the independently audited candidates)
 
 **Breaking:** malformed or mismatched SAM.gov responses are now tool errors; search results gain `pagination` and

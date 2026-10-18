@@ -2,6 +2,8 @@
  * Minimal read-only client for the public SAM.gov Get Opportunities API (v2).
  * Docs: https://open.gsa.gov/api/get-opportunities-public-api/
  */
+import { Worker, isMainThread, parentPort, workerData } from "node:worker_threads";
+
 export const SAM_BASE_URL = "https://api.sam.gov/opportunities/v2/search";
 export const MAX_PAGE_SIZE = 1000; // GSA maximum; the MCP tool keeps its smaller 100-record limit.
 export const MAX_PAGE_INDEX = 1_000_000;
@@ -101,14 +103,39 @@ export type SamErrorCode =
   | "INVALID_RESPONSE"
   | "NOT_FOUND"
   | "AMBIGUOUS_RESULT"
-  | "IDENTITY_MISMATCH";
+  | "IDENTITY_MISMATCH"
+  | "RESPONSE_TOO_COMPLEX"
+  | "CANCELLED";
 
+// Explicit fields, not parameter properties: this module also runs as the check worker, loaded from source by Node's
+// type stripping, which accepts only erasable TypeScript.
 export class SamGovError extends Error {
-  constructor(message: string, public status?: number, public code: SamErrorCode = "INVALID_INPUT") {
+  status?: number;
+  code: SamErrorCode;
+  constructor(message: string, status?: number, code: SamErrorCode = "INVALID_INPUT") {
     super(message);
     this.name = "SamGovError";
+    this.status = status;
+    this.code = code;
   }
 }
+
+/**
+ * Limits on checking one reply for the API key. `unitsPerChar` and `baseUnits` set a deterministic work budget: units
+ * are characters examined plus `unitsPerEscape` for each escape decoded, across every reading the scanner makes; the
+ * budget is `unitsPerChar` times the characters of all strings in the reply, plus `baseUnits`. `maxGrowth` bounds how
+ * much NFKC or a decoding round may lengthen a string (times its length, plus 256). `memoryMb` is the check worker's
+ * V8 old-generation heap. Exceeding any of them refuses the reply as RESPONSE_TOO_COMPLEX.
+ */
+export interface CheckLimits { unitsPerChar: number; unitsPerEscape: number; baseUnits: number; maxGrowth: number; memoryMb: number }
+export const CHECK_LIMITS: Readonly<CheckLimits> = Object.freeze({ unitsPerChar: 48, unitsPerEscape: 32, baseUnits: 1_000_000, maxGrowth: 4, memoryMb: 256 });
+type Budget = { left: number; perEscape: number; maxGrowth: number };
+
+const tooComplex = (why: string) => new SamGovError(`SAM.gov response ${why}; it was refused and none of it is returned.`, undefined, "RESPONSE_TOO_COMPLEX");
+const spend = (b: Budget | undefined, units: number) => {
+  if (b && (b.left -= units) < 0) throw tooComplex("needs more work than allowed to check it for the API key");
+};
+const growthLimit = (b: Budget | undefined, len: number) => (b?.maxGrowth ?? CHECK_LIMITS.maxGrowth) * len + 256;
 
 /** Accepts yyyy-mm-dd or MM/dd/yyyy and returns MM/dd/yyyy (the format SAM.gov requires). */
 export function toSamDate(input: string): string {
@@ -312,7 +339,7 @@ type Scanner = (s: string, start?: Uint32Array) => Scan;
  * strings read end to end) such an entity is dropped instead, because one string's end and the next one's start can
  * form it from ordinary text.
  */
-function keyScanner(core: string, joined = false): Scanner {
+function keyScanner(core: string, joined = false, budget?: Budget): Scanner {
   const words = Math.ceil(core.length / 32), top = core.length - 1;
   const masks = new Map<number, Uint32Array>();
   [...core].forEach((c, i) => {
@@ -338,7 +365,9 @@ function keyScanner(core: string, joined = false): Scanner {
   const scanRound = (t: string, start: Uint32Array, end: Uint32Array): boolean => {
     const d = start.slice(), alt = new Uint32Array(words);
     let hit = false, last = 0;
+    spend(budget, t.length);
     for (const m of t.matchAll(ESCAPE)) {
+      spend(budget, budget?.perEscape ?? 0);
       hit = feed(d, t.slice(last, m.index)) || hit;
       const decoded = decodeEscape(m[0], m[1], m[2]);
       if (decoded !== OUT_OF_RANGE) { alt.set(d); hit = feed(alt, decoded) || hit; }
@@ -353,13 +382,20 @@ function keyScanner(core: string, joined = false): Scanner {
   return (s, start = none) => {
     const end = new Uint32Array(words);
     let hit = false;
+    // Every reading is bounded before it is made: NFKC or a decoding round that lengthens the text past the growth
+    // limit refuses the reply, so no transient copy is larger than that limit.
+    const limit = growthLimit(budget, s.length);
     for (const strip of [false, true]) {
       // With inserted characters removed, an out-of-range entity may be joined up from ordinary text ("Fax & #: 202..."),
       // so it is dropped there rather than treated as possibly the key.
+      spend(budget, s.length);
       let t = strip ? s.normalize("NFKC").replace(INSERTED, "") : s.normalize("NFKC");
+      if (t.length > limit) throw tooComplex("grows too much when normalized to be checked for the API key");
       for (let round = 0; ; round++) {
         hit = scanRound(t, start, end) || hit;
+        spend(budget, t.length);
         let next = decodeOnce(t, strip || joined);
+        if (next !== undefined && next.length > limit) throw tooComplex("grows too much when decoded to be checked for the API key");
         if (next === undefined) return { hit: true, end };
         if (strip) next = next.replace(INSERTED, "");
         if (next === t) break;
@@ -375,11 +411,12 @@ function keyScanner(core: string, joined = false): Scanner {
  * Pattern redaction first (it keeps the rest of the text); then, fail-closed, any string in which keyScanner finds the
  * key is replaced whole. `after` receives each result, the scanner and the partial match left at its end.
  */
-function redactor(key?: string, after?: (out: string, scan: Scanner, end: Uint32Array) => void): (s: string) => string {
+function redactor(key?: string, after?: (out: string, scan: Scanner, end: Uint32Array) => void, budget?: Budget): (s: string) => string {
   const pattern = key ? keyPattern(key) : undefined;
   const core = keyCore(key);
-  const scan = core ? keyScanner(core) : undefined;
+  const scan = core ? keyScanner(core, false, budget) : undefined;
   return (s) => {
+    spend(budget, s.length);
     // The whole key first, so a parameter pattern cannot redact only its head.
     const out = (pattern ? s.replace(pattern, "REDACTED") : s)
       .replace(/api_key=[^&\s"']+/gi, "api_key=REDACTED").replace(/api_key%3D(?:[^&%\s"']|%(?!26)[0-9a-f]{2})+/gi, "api_key%3DREDACTED");
@@ -411,8 +448,47 @@ export const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
 /** Error bodies are only quoted (300 chars), so read at most this much of them. */
 export const MAX_ERROR_BODY_BYTES = 16 * 1024;
 
-/** Recursively redact every string (keys and values) in a parsed JSON value, within structure limits. */
-export function redactDeep<T>(value: T, key?: string): T {
+/** Length of `s` after NFKC, measured in 4096-character pieces so that no expanded copy of the whole is ever made. */
+function nfkcLength(s: string, stopAt: number): number {
+  let n = 0;
+  for (let i = 0; i < s.length && n <= stopAt; i += 4096) n += s.slice(i, i + 4096).normalize("NFKC").length;
+  return n;
+}
+
+/**
+ * Before any redaction: the structure limits, and how much NFKC lengthens each string and all of them together, are
+ * checked in one pass that holds no expanded copy. Returns the characters of all strings (names and values).
+ */
+function admit(value: unknown, maxGrowth: number): number {
+  let nodes = 0, chars = 0, grown = 0;
+  const text = (s: string) => {
+    chars += s.length;
+    const n = nfkcLength(s, maxGrowth * s.length + 256);
+    if (n > maxGrowth * s.length + 256) throw tooComplex("has text that grows too much when normalized to be checked for the API key");
+    grown += n;
+  };
+  const visit = (v: unknown, depth: number): void => {
+    if (++nodes > MAX_JSON_NODES || depth > MAX_JSON_DEPTH) throw new SamGovError("SAM.gov response exceeds JSON structure limits; narrow the search.", undefined, "INVALID_RESPONSE");
+    if (typeof v === "string") text(v);
+    else if (Array.isArray(v)) for (const item of v) visit(item, depth + 1);
+    else if (v && typeof v === "object") for (const [k, item] of Object.entries(v)) { text(k); visit(item, depth + 1); }
+  };
+  visit(value, 0);
+  // All strings together may grow by at most half the per-string factor (U+FDFA-style bodies stop here).
+  if (grown > (maxGrowth / 2) * chars + 65536) throw tooComplex("grows too much when normalized to be checked for the API key");
+  return chars;
+}
+
+/**
+ * Recursively redact every string (keys and values) in a parsed JSON value, within structure limits and the work
+ * budget of `limits` (CHECK_LIMITS by default). A reply over a limit is refused (RESPONSE_TOO_COMPLEX), never returned
+ * partly redacted. In the calling thread this bounds the work, not the time: SamGovClient runs it in a worker that is
+ * stopped at the deadline.
+ */
+export function redactDeep<T>(value: T, key?: string, limits: Partial<CheckLimits> = {}): T {
+  const lim = { ...CHECK_LIMITS, ...limits };
+  const chars = admit(value, lim.maxGrowth);
+  const budget: Budget = { left: lim.unitsPerChar * chars + lim.baseUnits, perEscape: lim.unitsPerEscape, maxGrowth: lim.maxGrowth };
   // A partial match of the key carried through every output string in output order, and separately through the
   // values and through the property names: a key split across neighbouring fields (value and value, name and value,
   // nested names) shows up only when they are read together. The carried match joins readings of different depths
@@ -429,10 +505,10 @@ export function redactDeep<T>(value: T, key?: string): T {
   };
   const redact = redactor(key, (out, scan, end) => {
     all = follow(all, out, scan, end); values = follow(values, out, scan, end); allParts.push(out); valueParts.push(out);
-  });
+  }, budget);
   const redactName = redactor(key, (out, scan, end) => {
     all = follow(all, out, scan, end); names = follow(names, out, scan, end); allParts.push(out); nameParts.push(out);
-  });
+  }, budget);
   let nodes = 0;
   const visit = (v: unknown, depth: number): unknown => {
     if (++nodes > MAX_JSON_NODES || depth > MAX_JSON_DEPTH) throw new SamGovError("SAM.gov response exceeds JSON structure limits; narrow the search.", undefined, "INVALID_RESPONSE");
@@ -463,7 +539,7 @@ export function redactDeep<T>(value: T, key?: string): T {
   const result = visit(value, 0) as T;
   const core = keyCore(key);
   if (core) {
-    const joined = keyScanner(core, true);
+    const joined = keyScanner(core, true, budget);
     if ([allParts, valueParts, nameParts].some((parts) => parts.length > 1 && joined(parts.join("")).hit))
       throw new SamGovError("SAM.gov response appears to contain the API key split across fields; it was refused and none of it is returned.", undefined, "INVALID_RESPONSE");
   }
@@ -579,33 +655,152 @@ export async function readCapped(body: ReadableStream<Uint8Array> | null, max: n
 /** Upstream or network error text is untrusted: redacted, then control/format/separator characters removed, truncated, labelled. */
 function excerpt(text: string, redact: (s: string) => string): string {
   // Redact the whole text, cut it, then redact the cut again: cutting can turn an escape after the key into one of its
-  // characters ("...012345678&#577" cut to "...012345678&#57").
-  return `[untrusted upstream text] ${redact(redact(text).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, " ").slice(0, 300))}`;
+  // characters ("...012345678&#577" cut to "...012345678&#57"). Text that cannot be checked is not shown at all.
+  try {
+    return `[untrusted upstream text] ${redact(redact(text).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, " ").slice(0, 300))}`;
+  } catch {
+    return "[untrusted upstream text could not be checked for the API key; not shown]";
+  }
 }
 
 const isTimeout = (e: unknown) => ["TimeoutError", "AbortError"].includes((e as Error)?.name);
 
 const NO_DATA = Symbol("no data");
 
+/** What to make of one reply: a search page, or the record for one noticeId. */
+export type ReplyJob = { kind: "search"; limit: number; offset: number } | { kind: "notice"; noticeId: string };
+
+/**
+ * Parses and validates one reply body and redacts the result: everything after the body is read. Pure and synchronous;
+ * SamGovClient runs it in a worker thread. `raw` null is HTTP 404 ("No Data found").
+ */
+export function checkReply(raw: string | null, job: ReplyJob, key: string, limits: Partial<CheckLimits> = {}): unknown {
+  let data: unknown = NO_DATA;
+  if (raw !== null) {
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      throw new SamGovError("SAM.gov returned a non-JSON response.", undefined, "INVALID_RESPONSE");
+    }
+  }
+  if (job.kind === "search") {
+    const { limit, offset } = job;
+    // 404 is "no data": an empty result. After the first page it does not say how many records exist.
+    const { total, list } = data === NO_DATA ? { total: offset === 0 ? 0 : null, list: [] } : parseEnvelope(data, limit, offset);
+    // Whether records remain upstream is separate from whether this client can request the next page index.
+    const hasMore = total !== null && (offset + 1) * limit < total;
+    const atLimit = hasMore && offset >= MAX_PAGE_INDEX;
+    const pagination: Pagination = {
+      page_index: offset,
+      page_size: limit,
+      returned_count: list.length,
+      partial: !(offset === 0 && list.length === total),
+      has_more: hasMore,
+      next_offset: hasMore && !atLimit ? offset + 1 : null,
+      page_limit_reached: atLimit,
+    };
+    return redactDeep({ total, results: list.map(summarize), pagination, source: SOURCE_NOTICE }, key, limits);
+  }
+  if (data === NO_DATA) return null;
+  const { total, list } = parseEnvelope(data, 1, 0);
+  if (list.length === 0) {
+    if (total === 0) return null;
+    throw new SamGovError("SAM.gov reported matching notices but returned none; no result can be trusted.", undefined, "INVALID_RESPONSE");
+  }
+  if (total !== 1) throw new SamGovError(`SAM.gov reported ${total} records for one noticeId; refusing to pick one.`, undefined, "AMBIGUOUS_RESULT");
+  if (list[0].noticeId.toLowerCase() !== job.noticeId.toLowerCase()) {
+    throw new SamGovError("SAM.gov returned a different notice than the one requested; no result can be trusted.", undefined, "IDENTITY_MISMATCH");
+  }
+  return redactDeep(list[0], key, limits);
+}
+
+const WORKER_TAG = "sam-gov-mcp:check-reply";
+type WorkerReply = { ok: true; value: unknown } | { ok: false; code: SamErrorCode; message: string; status?: number };
+
+export interface ClientOptions {
+  /** Work budget and memory limits for checking each reply (CHECK_LIMITS by default). */
+  limits?: Partial<CheckLimits>;
+  /** The module the check worker runs; this module by default. Tests use it to stand in a worker that never ends. */
+  workerUrl?: URL;
+}
+
+/** Per call: an AbortSignal that cancels the call (an MCP client's cancellation, for example). */
+export interface CallOptions { signal?: AbortSignal }
+
 export class SamGovClient {
   private redact: (s: string) => string;
+  private apiKey: string;
+  private fetchImpl: FetchLike;
+  private base: string;
+  private timeoutMs: number;
+  private limits: CheckLimits;
+  private workerUrl: URL;
 
-  constructor(
-    private apiKey: string,
-    private fetchImpl: FetchLike = fetch as unknown as FetchLike,
-    private base = SAM_BASE_URL,
-    private timeoutMs = DEFAULT_TIMEOUT_MS,
-  ) {
+  constructor(apiKey: string, fetchImpl: FetchLike = fetch as unknown as FetchLike, base = SAM_BASE_URL, timeoutMs = DEFAULT_TIMEOUT_MS, options: ClientOptions = {}) {
     if (!apiKey) throw new SamGovError("SAM_API_KEY is not set. Get a free key at https://sam.gov (Account Details > API Key).", undefined, "MISSING_CONFIGURATION");
     if (!VALID_KEY.test(apiKey)) throw new SamGovError("SAM_API_KEY must be 1 to 256 printable ASCII characters other than spaces, line breaks, % and \\.", undefined, "MISSING_CONFIGURATION");
     if (markerLike(apiKey)) throw new SamGovError("SAM_API_KEY looks like this server's redaction marker; use the key issued by SAM.gov.", undefined, "MISSING_CONFIGURATION");
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300_000) throw new SamGovError("timeoutMs must be an integer from 1 to 300000.");
+    const limits = { ...CHECK_LIMITS, ...options.limits };
+    if (!Object.values(limits).every((v) => Number.isSafeInteger(v) && v >= 1) || limits.memoryMb < 16 || limits.memoryMb > 4096)
+      throw new SamGovError("Check limits must be positive integers, with memoryMb from 16 to 4096.");
+    this.apiKey = apiKey;
+    this.fetchImpl = fetchImpl;
+    this.base = base;
+    this.timeoutMs = timeoutMs;
+    this.limits = limits;
+    this.workerUrl = options.workerUrl ?? new URL(import.meta.url);
     this.redact = redactor(apiKey);
   }
 
-  private async get(url: string): Promise<unknown> {
-    // One deadline covers the request, reading the body and the result; cleanup is never awaited past it.
-    const signal = AbortSignal.timeout(this.timeoutMs);
+  /**
+   * One deadline and one cancellation signal cover the whole call: the request, reading the body, parsing, checking
+   * and redaction. The check runs in a worker thread that is stopped (terminate) when either fires, so a reply that
+   * keeps the check busy cannot hold the call past its deadline or keep this thread from answering.
+   */
+  private async call(url: string, job: ReplyJob, cancel?: AbortSignal): Promise<unknown> {
+    const deadline = AbortSignal.timeout(this.timeoutMs);
+    const signal = cancel ? AbortSignal.any([deadline, cancel]) : deadline;
+    const raw = await this.get(url, signal, cancel);
+    if (raw === NO_DATA) return checkReply(null, job, this.apiKey, this.limits); // a few fixed fields: nothing to bound
+    return this.checkInWorker(raw, job, signal, cancel);
+  }
+
+  private checkInWorker(raw: string, job: ReplyJob, signal: AbortSignal, cancel?: AbortSignal): Promise<unknown> {
+    const stopped = () => cancel?.aborted
+      ? new SamGovError("The request was cancelled; nothing was returned.", undefined, "CANCELLED")
+      : new SamGovError(`Checking the SAM.gov response did not finish within ${this.timeoutMs} ms; nothing was returned.`, undefined, "TIMEOUT");
+    if (signal.aborted) return Promise.reject(stopped());
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const worker = new Worker(this.workerUrl, {
+        workerData: { tag: WORKER_TAG, raw, job, key: this.apiKey, limits: this.limits },
+        resourceLimits: { maxOldGenerationSizeMb: this.limits.memoryMb, maxYoungGenerationSizeMb: 32, stackSizeMb: 4 },
+        stdout: true, // never let the worker write to this process's stdout, which carries the MCP protocol
+        stderr: true,
+      });
+      worker.stdout.resume();
+      worker.stderr.resume();
+      const settle = (then: () => void) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        worker.terminate().catch(() => {});
+        then();
+      };
+      const onAbort = () => settle(() => reject(stopped()));
+      signal.addEventListener("abort", onAbort, { once: true });
+      worker.once("message", (m: WorkerReply) => settle(() => (m.ok ? resolve(m.value) : reject(new SamGovError(m.message, m.status, m.code)))));
+      // The worker's own error text is never passed on: it could quote the reply.
+      worker.once("error", (e: Error & { code?: string }) => settle(() => reject(e?.code === "ERR_WORKER_OUT_OF_MEMORY"
+        ? tooComplex(`needs more than ${this.limits.memoryMb} MB to check it for the API key`)
+        : new SamGovError("Checking the SAM.gov response failed; nothing was returned.", undefined, "INVALID_RESPONSE"))));
+      worker.once("exit", () => settle(() => reject(new SamGovError("Checking the SAM.gov response stopped before it finished; nothing was returned.", undefined, "INVALID_RESPONSE"))));
+    });
+  }
+
+  private async get(url: string, signal: AbortSignal, cancel?: AbortSignal): Promise<string | typeof NO_DATA> {
+    const cancelled = () => new SamGovError("The request was cancelled; nothing was returned.", undefined, "CANCELLED");
     let res;
     let pending: Promise<Awaited<ReturnType<FetchLike>>> | undefined;
     try {
@@ -614,6 +809,7 @@ export class SamGovClient {
       res = await Promise.race([pending, rejectOnAbort(signal)]);
     } catch (e) {
       pending?.then((late) => release(late, "timed out"), () => {});
+      if (cancel?.aborted) throw cancelled();
       // Network errors can carry the request URL (which contains the key); never pass them through raw.
       if (isTimeout(e)) throw new SamGovError(`SAM.gov did not respond within ${this.timeoutMs} ms.`, undefined, "TIMEOUT");
       throw new SamGovError(`Could not reach SAM.gov: ${excerpt(String((e as Error)?.message ?? e), this.redact)}`, undefined, "NETWORK_ERROR");
@@ -630,47 +826,26 @@ export class SamGovClient {
       try {
         body = excerpt(await readCapped(res.body, MAX_ERROR_BODY_BYTES, signal), this.redact);
       } catch (e) {
+        if (cancel?.aborted) throw cancelled();
         body = e instanceof ResponseTooLarge ? "(error body too large; not read)"
           : isTimeout(e) ? `(error body not read within ${this.timeoutMs} ms)` : "(error body could not be read)";
       }
       throw new SamGovError(`SAM.gov returned HTTP ${res.status}: ${body}`, res.status, "UPSTREAM_HTTP_ERROR");
     }
-    let raw: string;
     try {
-      raw = await readCapped(res.body, MAX_RESPONSE_BYTES, signal);
+      return await readCapped(res.body, MAX_RESPONSE_BYTES, signal);
     } catch (e) {
+      if (cancel?.aborted) throw cancelled();
       if (e instanceof ResponseTooLarge) throw new SamGovError("SAM.gov response too large; narrow the search.", undefined, "RESPONSE_TOO_LARGE");
       if (isTimeout(e)) throw new SamGovError(`SAM.gov did not finish responding within ${this.timeoutMs} ms.`, undefined, "TIMEOUT");
       throw new SamGovError(`Failed reading SAM.gov response: ${excerpt(String((e as Error)?.message ?? e), this.redact)}`, undefined, "NETWORK_ERROR");
     }
-    try {
-      return JSON.parse(raw);
-    } catch {
-      throw new SamGovError("SAM.gov returned a non-JSON response.", undefined, "INVALID_RESPONSE");
-    }
   }
 
   /** One page of results. Never fetches further pages; `pagination` says whether more exist. */
-  async search(p: SearchParams): Promise<SearchResult> {
+  async search(p: SearchParams, opts: CallOptions = {}): Promise<SearchResult> {
     const url = buildSearchUrl(this.apiKey, p, this.base);
-    const limit = p.limit ?? 10;
-    const offset = p.offset ?? 0;
-    const data = await this.get(url);
-    // 404 is "no data": an empty result. After the first page it does not say how many records exist.
-    const { total, list } = data === NO_DATA ? { total: offset === 0 ? 0 : null, list: [] } : parseEnvelope(data, limit, offset);
-    // Whether records remain upstream is separate from whether this client can request the next page index.
-    const hasMore = total !== null && (offset + 1) * limit < total;
-    const atLimit = hasMore && offset >= MAX_PAGE_INDEX;
-    const pagination: Pagination = {
-      page_index: offset,
-      page_size: limit,
-      returned_count: list.length,
-      partial: !(offset === 0 && list.length === total),
-      has_more: hasMore,
-      next_offset: hasMore && !atLimit ? offset + 1 : null,
-      page_limit_reached: atLimit,
-    };
-    return redactDeep({ total, results: list.map(summarize), pagination, source: SOURCE_NOTICE }, this.apiKey);
+    return this.call(url, { kind: "search", limit: p.limit ?? 10, offset: p.offset ?? 0 }, opts.signal) as Promise<SearchResult>;
   }
 
   /**
@@ -678,7 +853,7 @@ export class SamGovClient {
    * when SAM.gov has no such notice. A response that names a different notice, or more than one, is an
    * error, never an answer. IDs are compared case-insensitively (SAM.gov notice IDs are hexadecimal).
    */
-  async getOpportunity(noticeId: string, lookbackDays = 365): Promise<Record<string, unknown> | null> {
+  async getOpportunity(noticeId: string, lookbackDays = 365, opts: CallOptions = {}): Promise<Record<string, unknown> | null> {
     if (!validNoticeId(noticeId)) throw new SamGovError("Invalid noticeId.");
     if (!Number.isSafeInteger(lookbackDays) || lookbackDays < 1 || lookbackDays > 365) throw new SamGovError("lookbackDays must be an integer from 1 to 365.");
     const to = new Date();
@@ -686,17 +861,21 @@ export class SamGovClient {
     const fmt = (d: Date) => d.toISOString().slice(0, 10);
     const url = buildSearchUrl(this.apiKey, { postedFrom: fmt(from), postedTo: fmt(to), limit: 1 }, this.base) +
       `&noticeid=${encodeURIComponent(noticeId)}`;
-    const data = await this.get(url);
-    if (data === NO_DATA) return null;
-    const { total, list } = parseEnvelope(data, 1, 0);
-    if (list.length === 0) {
-      if (total === 0) return null;
-      throw new SamGovError("SAM.gov reported matching notices but returned none; no result can be trusted.", undefined, "INVALID_RESPONSE");
-    }
-    if (total !== 1) throw new SamGovError(`SAM.gov reported ${total} records for one noticeId; refusing to pick one.`, undefined, "AMBIGUOUS_RESULT");
-    if (list[0].noticeId.toLowerCase() !== noticeId.toLowerCase()) {
-      throw new SamGovError("SAM.gov returned a different notice than the one requested; no result can be trusted.", undefined, "IDENTITY_MISMATCH");
-    }
-    return redactDeep(list[0], this.apiKey);
+    return this.call(url, { kind: "notice", noticeId }, opts.signal) as Promise<Record<string, unknown> | null>;
   }
+}
+
+// This module is also the check worker: started by SamGovClient with WORKER_TAG, it checks one reply and posts the
+// result or a SamGovError's code and message (never another error's text, which could quote the reply).
+if (!isMainThread && (workerData as { tag?: string } | null)?.tag === WORKER_TAG) {
+  const { raw, job, key, limits } = workerData as { raw: string; job: ReplyJob; key: string; limits: CheckLimits };
+  let reply: WorkerReply;
+  try {
+    reply = { ok: true, value: checkReply(raw, job, key, limits) };
+  } catch (e) {
+    reply = e instanceof SamGovError ? { ok: false, code: e.code, message: e.message, status: e.status }
+      : e instanceof RangeError ? { ok: false, code: "RESPONSE_TOO_COMPLEX", message: tooComplex("could not be checked for the API key within the worker's limits").message }
+      : { ok: false, code: "INVALID_RESPONSE", message: "Checking the SAM.gov response failed; nothing was returned." };
+  }
+  parentPort!.postMessage(reply);
 }
