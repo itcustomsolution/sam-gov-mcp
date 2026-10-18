@@ -267,6 +267,8 @@ const ESCAPE = /%[c-f][0-9a-f](?:%[89ab][0-9a-f]){1,3}|%[0-9a-f]{2}|\\u[0-9a-f]{
  * the characters escapes are written with ("%", "\\", "&", "#", ";"). */
 const INSERTED = /[^A-Za-z0-9%\\&#;]/g;
 const OUT_OF_RANGE = Symbol("numeric entity beyond U+10FFFF");
+/** The letters JSON writes for a control character that has a short escape; the others are written as \u00XX. */
+const JSON_ESCAPE: Record<number, string> = { 8: "b", 9: "t", 10: "n", 12: "f", 13: "r" };
 /** Named entities for the characters escapes are written with, decoded so a doubly escaped key ("&amp;#83;") is read. */
 const NAMED: Record<string, string> = { amp: "&", num: "#", percnt: "%", bsol: "\\", semi: ";" };
 
@@ -307,7 +309,7 @@ function decodeOnce(t: string, dropOutOfRange = false): string | undefined {
   return bad && !dropOutOfRange ? undefined : out;
 }
 
-const fold = (t: string) => t.normalize("NFKC").toLowerCase().replace(/[^a-z0-9]/g, "");
+const fold = (t: string) => t.normalize("NFKD").toLowerCase().replace(/[^a-z0-9]/g, "");
 
 /**
  * The letters and digits of `s`, case-folded, after decoding every escape round after round until nothing changes.
@@ -348,31 +350,48 @@ function keyScanner(core: string, joined = false, budget?: Budget): Scanner {
     masks.set(c.charCodeAt(0), m);
   });
   const none = new Uint32Array(words);
+  const alt = new Uint32Array(words);
+  // One letter or digit into the state `d`, in place; true once the whole key has been read.
+  const step = (d: Uint32Array, c: number): boolean => {
+    const m = masks.get(c) ?? none;
+    let carry = 1;
+    for (let w = 0; w < words; w++) { const v = d[w]; d[w] = ((v << 1) | carry) & m[w]; carry = v >>> 31; }
+    return ((d[top >>> 5] >>> (top & 31)) & 1) === 1;
+  };
   // Feeds the letters and digits of `text` into the state `d`, in place; true once the whole key has been read.
   const feed = (d: Uint32Array, text: string): boolean => {
     let hit = false;
-    const t = text.normalize("NFKC").toLowerCase();
+    // NFKD, not NFKC: composition would merge a letter and a following combining mark ("b" + U+0307) into one
+    // non-ASCII letter, which is then dropped; decomposed, the letter is read and the mark is a separator.
+    const t = text.normalize("NFKD").toLowerCase();
     for (let k = 0; k < t.length; k++) {
       const c = t.charCodeAt(k);
+      // Results leave this server as JSON text, which writes a control character or a lone surrogate as an escape
+      // ("\b", "\n", "\u0001", "\udc00"): such a character is read both ways at once, as a separator and as the
+      // letters JSON writes for it, so a key whose letters were sent as control characters is found in one pass.
+      const lone = c >= 0xd800 && c <= 0xdfff && !(c <= 0xdbff ? (t.charCodeAt(k + 1) & 0xfc00) === 0xdc00 : k > 0 && (t.charCodeAt(k - 1) & 0xfc00) === 0xd800);
+      if (c < 32 || lone) {
+        alt.set(d);
+        for (const e of JSON_ESCAPE[c] ?? "u" + c.toString(16).padStart(4, "0")) hit = step(alt, e.charCodeAt(0)) || hit;
+        for (let w = 0; w < words; w++) d[w] |= alt[w];
+        continue;
+      }
       if (!((c >= 48 && c <= 57) || (c >= 97 && c <= 122))) continue; // not a letter or digit: dropped, as a separator
-      const m = masks.get(c) ?? none;
-      let carry = 1;
-      for (let w = 0; w < words; w++) { const v = d[w]; d[w] = ((v << 1) | carry) & m[w]; carry = v >>> 31; }
-      if ((d[top >>> 5] >>> (top & 31)) & 1) hit = true;
+      hit = step(d, c) || hit;
     }
     return hit;
   };
   const scanRound = (t: string, start: Uint32Array, end: Uint32Array): boolean => {
-    const d = start.slice(), alt = new Uint32Array(words);
+    const d = start.slice(), branch = new Uint32Array(words);
     let hit = false, last = 0;
     spend(budget, t.length);
     for (const m of t.matchAll(ESCAPE)) {
       spend(budget, budget?.perEscape ?? 0);
       hit = feed(d, t.slice(last, m.index)) || hit;
       const decoded = decodeEscape(m[0], m[1], m[2]);
-      if (decoded !== OUT_OF_RANGE) { alt.set(d); hit = feed(alt, decoded) || hit; }
+      if (decoded !== OUT_OF_RANGE) { branch.set(d); hit = feed(branch, decoded) || hit; }
       hit = feed(d, m[0]) || hit;
-      if (decoded !== OUT_OF_RANGE) for (let w = 0; w < words; w++) d[w] |= alt[w];
+      if (decoded !== OUT_OF_RANGE) for (let w = 0; w < words; w++) d[w] |= branch[w];
       last = m.index! + m[0].length;
     }
     hit = feed(d, t.slice(last)) || hit;
@@ -422,16 +441,7 @@ function redactor(key?: string, after?: (out: string, scan: Scanner, end: Uint32
       .replace(/api_key=[^&\s"']+/gi, "api_key=REDACTED").replace(/api_key%3D(?:[^&%\s"']|%(?!26)[0-9a-f]{2})+/gi, "api_key%3DREDACTED");
     if (!scan) return out;
     let r = scan(out);
-    let hit = r.hit;
-    if (!hit) {
-      // Results leave this server as JSON text, where a control character is written as an escape ("\b", "\f",
-      // "\n", "\u0001"): a string whose serialized form differs is also read the way it will be written.
-      const ser = JSON.stringify(out);
-      if (ser.length !== out.length + 2) {
-        spend(budget, ser.length);
-        hit = scan(ser.slice(1, -1)).hit;
-      }
-    }
+    const hit = r.hit;
     const result = hit ? "REDACTED" : out;
     if (hit) r = scan(result);
     after?.(result, scan, r.end);
@@ -519,7 +529,7 @@ export function redactDeep<T>(value: T, key?: string, limits: Partial<CheckLimit
   const redactName = redactor(key, (out, scan, end) => {
     all = follow(all, out, scan, end); names = follow(names, out, scan, end); allParts.push(out); nameParts.push(out);
   }, budget);
-  let nodes = 0;
+  let nodes = 0, reordered = false;
   const visit = (v: unknown, depth: number): unknown => {
     if (++nodes > MAX_JSON_NODES || depth > MAX_JSON_DEPTH) throw new SamGovError("SAM.gov response exceeds JSON structure limits; narrow the search.", undefined, "INVALID_RESPONSE");
     if (typeof v === "string") return redact(v);
@@ -528,6 +538,7 @@ export function redactDeep<T>(value: T, key?: string, limits: Partial<CheckLimit
       const out: Record<string, unknown> = {};
       const nextSuffix = new Map<string, number>(); // per name, so many collisions stay linear
       for (const [k, item] of Object.entries(v)) {
+        if (!reordered && /^(?:0|[1-9]\d{0,9})$/.test(k)) reordered = true; // an array-index-like name
         // Two keys that redact to the same name both stay: the later one gets a numeric suffix.
         const base = redactName(k);
         let name = base;
@@ -550,9 +561,11 @@ export function redactDeep<T>(value: T, key?: string, limits: Partial<CheckLimit
   const core = keyCore(key);
   if (core) {
     const joined = keyScanner(core, true, budget);
-    const written = (parts: string[]) => parts.map((p) => JSON.stringify(p).slice(1, -1)).join("");
-    if ([allParts, valueParts, nameParts].some((parts) => parts.length > 1 && (joined(parts.join("")).hit
-        || (parts.some((p) => JSON.stringify(p).length !== p.length + 2) && joined(written(parts)).hit))))
+    if ([allParts, valueParts, nameParts].some((parts) => parts.length > 1 && joined(parts.join("")).hit))
+      throw new SamGovError("SAM.gov response appears to contain the API key split across fields; it was refused and none of it is returned.", undefined, "INVALID_RESPONSE");
+    // JSON writes integer-like property names first, so where there is one the output's order can differ from the
+    // input's: the result is then also read once as it will be written.
+    if (reordered && joined(JSON.stringify(result) ?? "").hit)
       throw new SamGovError("SAM.gov response appears to contain the API key split across fields; it was refused and none of it is returned.", undefined, "INVALID_RESPONSE");
   }
   return result;
@@ -817,14 +830,16 @@ export class SamGovClient {
     } catch {
       throw stopped(false);
     }
+    let exited: Promise<unknown> = Promise.resolve();
     try {
-      return await this.runWorker(raw, job, signal, stopped);
+      return await this.runWorker(raw, job, signal, stopped, (p) => { exited = p; });
     } finally {
-      release();
+      exited.then(release, release); // the slot is free once the thread is gone, so at most 2 threads are alive
     }
   }
 
-  private runWorker(raw: string, job: ReplyJob, signal: AbortSignal, stopped: (started?: boolean) => SamGovError): Promise<unknown> {
+  private runWorker(raw: string, job: ReplyJob, signal: AbortSignal, stopped: (started?: boolean) => SamGovError,
+                    onThread: (exited: Promise<unknown>) => void): Promise<unknown> {
     if (signal.aborted) return Promise.reject(stopped(false)); // its turn came as the deadline passed: it never started
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -834,6 +849,7 @@ export class SamGovClient {
         stdout: true, // never let the worker write to this process's stdout, which carries the MCP protocol
         stderr: true,
       });
+      onThread(new Promise((done) => worker.once("exit", done)));
       worker.stdout.resume();
       worker.stderr.resume();
       const settle = (then: () => void) => {

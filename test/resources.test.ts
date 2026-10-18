@@ -193,3 +193,46 @@ describe("R6 review round 1 (omar): output form, main-thread text, concurrency",
     expect((await new SamGovClient(KEY, reply(notice({}))).getOpportunity("n1"))?.noticeId).toBe("n1"); // slots released
   });
 });
+
+describe("R6 review round 2 (omar): combining marks, output order, thread count", () => {
+  const ch = (n: number) => String.fromCharCode(n);
+  it("OM-R6B-01: a letter written as a control character plus a combining mark is still read as the letter", async () => {
+    const bad = KEY.replace("b", ch(8) + ch(0x307)).replace("f", ch(12));
+    const o = await new SamGovClient(KEY, reply(notice({ x: bad }))).getOpportunity("n1");
+    expect(o?.x).toBe("REDACTED");
+  });
+
+  it("OM-R6B-01: a combining mark after a key letter (with an escape left as text) does not hide the key", async () => {
+    const bad = "&amp;#83;YNTHETIC-se" + ch(0x301) + "ntinel-key-0123456789abcdef";
+    const o = await new SamGovClient(KEY, reply(notice({ x: bad }))).getOpportunity("n1");
+    expect(o?.x).toBe("REDACTED");
+  });
+
+  it("OM-R6B-02: JSON's own property order (integer-like names first) is read too", async () => {
+    const digits = "1234567890";
+    const e = await err(new SamGovClient(digits, reply({ totalRecords: 1, opportunitiesData: [{ noticeId: "n1", "1": "x1", [digits]: "y", "2345678900": "z" }] })).getOpportunity("n1"));
+    expect(e?.code).toBe("INVALID_RESPONSE");
+  });
+
+  it("OM-R6B-03: a check's slot is freed only when its thread has exited, so at most 2 threads are alive", async () => {
+    const wt = await import("node:worker_threads");
+    const { syncBuiltinESMExports } = await import("node:module");
+    const Real = wt.default.Worker;
+    let live = 0, maxLive = 0;
+    wt.default.Worker = class extends Real {
+      constructor(...a: ConstructorParameters<typeof Real>) { super(...a); maxLive = Math.max(maxLive, ++live); this.once("exit", () => live--); }
+    } as typeof Real;
+    syncBuiltinESMExports();
+    try {
+      const calls = Array.from({ length: 8 }, () => err(new SamGovClient(KEY, reply(notice({})), undefined, 120, { workerUrl: fixture("spin-worker.mjs") }).getOpportunity("n1")));
+      expect((await Promise.all(calls)).every((e) => e?.code === "TIMEOUT")).toBe(true);
+      await new Promise((r) => setTimeout(r, 200)); // let the last threads exit
+    } finally {
+      wt.default.Worker = Real;
+      syncBuiltinESMExports();
+    }
+    expect(maxLive).toBeGreaterThan(0);
+    expect(maxLive).toBeLessThanOrEqual(2);
+    expect(live).toBe(0);
+  });
+});
