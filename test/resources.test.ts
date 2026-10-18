@@ -156,3 +156,40 @@ describe("R6: packaged metadata matches the package", () => {
     expect([lock.version, lock.packages[""].version, reg.version, reg.packages[0].version, VERSION]).toEqual(Array(5).fill(pkg.version));
   });
 });
+
+describe("R6 review round 1 (omar): output form, main-thread text, concurrency", () => {
+  const ctl = (n: number) => String.fromCharCode(n);
+  it("OM-R6-01: a key written with control characters for letters is caught in the form the output writes it", async () => {
+    const bad = KEY.replace("b", ctl(8)).replace("f", ctl(12)); // JSON writes these as \b and \f
+    const o = await new SamGovClient(KEY, reply(notice({ x: bad }))).getOpportunity("n1");
+    const out = JSON.stringify(o, null, 2);
+    expect(out).not.toContain("a\\bcde\\f");
+    expect(o?.x).toBe("REDACTED");
+  });
+
+  it("OM-R6-01: the same key split across two fields is refused, not returned", async () => {
+    const bad = KEY.replace("b", ctl(8)).replace("f", ctl(12));
+    const e = await err(new SamGovClient(KEY, reply(notice({ x: bad.slice(0, 30), y: bad.slice(30) }))).getOpportunity("n1"));
+    expect(e?.code).toBe("INVALID_RESPONSE");
+  });
+
+  it("OM-R6-02: a huge network error message is cut before it is redacted on this thread", async () => {
+    const boom = vi.fn(async () => { throw new Error("%41".repeat(4 << 20) + KEY); }); // 12 MB of escapes: seconds if redacted whole
+    const t0 = Date.now();
+    const e = await err(new SamGovClient(KEY, boom as any).search(range));
+    expect(e?.code).toBe("NETWORK_ERROR");
+    expect(e?.message.length).toBeLessThan(400);
+    expect(e?.message).not.toContain(KEY);
+    expect(Date.now() - t0).toBeLessThan(300);
+  });
+
+  it("OM-R6-05: at most two checks run at once; a third waits under its own deadline and says it did not start", async () => {
+    const mk = (ms: number) => new SamGovClient(KEY, reply(notice({})), undefined, ms, { workerUrl: fixture("spin-worker.mjs") }).getOpportunity("n1");
+    // Two checks hold both slots for 900 ms; the third, with a 300 ms deadline, can only time out while it waits.
+    const errs = await Promise.all([mk(900), mk(900), mk(300)].map(err));
+    expect(errs.map((e) => e?.code)).toEqual(["TIMEOUT", "TIMEOUT", "TIMEOUT"]);
+    expect(errs[2]?.message).toBe("Checking the SAM.gov response did not start within 300 ms (other checks were running); nothing was returned.");
+    expect(errs[0]?.message).toContain("did not finish within 900 ms");
+    expect((await new SamGovClient(KEY, reply(notice({}))).getOpportunity("n1"))?.noticeId).toBe("n1"); // slots released
+  });
+});

@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.2.0-rc.6] - unreleased candidate (2026-10-18, not published; 0.2.0-rc.5 and earlier were audited and are frozen)
+## [0.2.0-rc.6] - unreleased candidate (2026-10-17, not published; 0.2.0-rc.5 and earlier were audited and are frozen)
 
 - R5-SAM-RES: checking a reply for the API key is bounded and stoppable. Everything after the body is read
   (JSON parsing, format checks, transformation-aware redaction) runs in a worker thread with a 256 MB heap limit
@@ -12,6 +12,10 @@
   a cancelled call is the new `CANCELLED`.
 - `SamGovClient` takes a fifth argument `{ limits, workerUrl }`; `redactDeep` takes `limits`; `checkReply` and
   `CHECK_LIMITS` are exported.
+- Internal security review fixes (round 1): a string is also checked in the form the JSON output writes it, so a key
+  written with control characters for letters (shown as `\b`, `\f` in the output) is caught (also present in
+  rc.5); network error text is cut to 16 KB before it is redacted in the main thread; each string costs a fixed 16
+  units; at most 2 checks run at once.
 - `server.json` (MCP registry metadata) had stayed at 0.2.0-rc.2 through rc.3 to rc.5; it now matches the package
   version, and a test keeps them equal.
 - Previously measured (r5, crafted 5 MB replies): about 10 s of CPU or about 1 GB of memory. Those shapes, scaled to

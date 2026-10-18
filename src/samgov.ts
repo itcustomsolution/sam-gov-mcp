@@ -416,14 +416,24 @@ function redactor(key?: string, after?: (out: string, scan: Scanner, end: Uint32
   const core = keyCore(key);
   const scan = core ? keyScanner(core, false, budget) : undefined;
   return (s) => {
-    spend(budget, s.length);
+    spend(budget, s.length + 16); // a fixed charge per string, so many short strings are not free
     // The whole key first, so a parameter pattern cannot redact only its head.
     const out = (pattern ? s.replace(pattern, "REDACTED") : s)
       .replace(/api_key=[^&\s"']+/gi, "api_key=REDACTED").replace(/api_key%3D(?:[^&%\s"']|%(?!26)[0-9a-f]{2})+/gi, "api_key%3DREDACTED");
     if (!scan) return out;
     let r = scan(out);
-    const result = r.hit ? "REDACTED" : out;
-    if (r.hit) r = scan(result);
+    let hit = r.hit;
+    if (!hit) {
+      // Results leave this server as JSON text, where a control character is written as an escape ("\b", "\f",
+      // "\n", "\u0001"): a string whose serialized form differs is also read the way it will be written.
+      const ser = JSON.stringify(out);
+      if (ser.length !== out.length + 2) {
+        spend(budget, ser.length);
+        hit = scan(ser.slice(1, -1)).hit;
+      }
+    }
+    const result = hit ? "REDACTED" : out;
+    if (hit) r = scan(result);
     after?.(result, scan, r.end);
     return result;
   };
@@ -540,7 +550,9 @@ export function redactDeep<T>(value: T, key?: string, limits: Partial<CheckLimit
   const core = keyCore(key);
   if (core) {
     const joined = keyScanner(core, true, budget);
-    if ([allParts, valueParts, nameParts].some((parts) => parts.length > 1 && joined(parts.join("")).hit))
+    const written = (parts: string[]) => parts.map((p) => JSON.stringify(p).slice(1, -1)).join("");
+    if ([allParts, valueParts, nameParts].some((parts) => parts.length > 1 && (joined(parts.join("")).hit
+        || (parts.some((p) => JSON.stringify(p).length !== p.length + 2) && joined(written(parts)).hit))))
       throw new SamGovError("SAM.gov response appears to contain the API key split across fields; it was refused and none of it is returned.", undefined, "INVALID_RESPONSE");
   }
   return result;
@@ -715,6 +727,33 @@ export function checkReply(raw: string | null, job: ReplyJob, key: string, limit
 }
 
 const WORKER_TAG = "sam-gov-mcp:check-reply";
+/** Checks running at once in this process; more wait their turn under their own deadline. */
+export const MAX_CONCURRENT_CHECKS = 2;
+let activeChecks = 0;
+const waitingChecks: Array<() => void> = [];
+function acquireCheck(signal: AbortSignal): Promise<() => void> {
+  return new Promise((resolve, reject) => {
+    const grant = () => {
+      activeChecks++;
+      let released = false;
+      resolve(() => {
+        if (released) return;
+        released = true;
+        activeChecks--;
+        waitingChecks.shift()?.();
+      });
+    };
+    if (activeChecks < MAX_CONCURRENT_CHECKS) return grant();
+    const wake = () => { signal.removeEventListener("abort", onAbort); grant(); };
+    const onAbort = () => {
+      const i = waitingChecks.indexOf(wake);
+      if (i >= 0) waitingChecks.splice(i, 1);
+      reject(signal.reason);
+    };
+    waitingChecks.push(wake);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
 type WorkerReply = { ok: true; value: unknown } | { ok: false; code: SamErrorCode; message: string; status?: number };
 
 export interface ClientOptions {
@@ -766,11 +805,27 @@ export class SamGovClient {
     return this.checkInWorker(raw, job, signal, cancel);
   }
 
-  private checkInWorker(raw: string, job: ReplyJob, signal: AbortSignal, cancel?: AbortSignal): Promise<unknown> {
-    const stopped = () => cancel?.aborted
+  private async checkInWorker(raw: string, job: ReplyJob, signal: AbortSignal, cancel?: AbortSignal): Promise<unknown> {
+    const stopped = (started = true) => cancel?.aborted
       ? new SamGovError("The request was cancelled; nothing was returned.", undefined, "CANCELLED")
-      : new SamGovError(`Checking the SAM.gov response did not finish within ${this.timeoutMs} ms; nothing was returned.`, undefined, "TIMEOUT");
-    if (signal.aborted) return Promise.reject(stopped());
+      : started ? new SamGovError(`Checking the SAM.gov response did not finish within ${this.timeoutMs} ms; nothing was returned.`, undefined, "TIMEOUT")
+        : new SamGovError(`Checking the SAM.gov response did not start within ${this.timeoutMs} ms (other checks were running); nothing was returned.`, undefined, "TIMEOUT");
+    if (signal.aborted) throw stopped();
+    let release: () => void;
+    try {
+      release = await acquireCheck(signal);
+    } catch {
+      throw stopped(false);
+    }
+    try {
+      return await this.runWorker(raw, job, signal, stopped);
+    } finally {
+      release();
+    }
+  }
+
+  private runWorker(raw: string, job: ReplyJob, signal: AbortSignal, stopped: (started?: boolean) => SamGovError): Promise<unknown> {
+    if (signal.aborted) return Promise.reject(stopped(false)); // its turn came as the deadline passed: it never started
     return new Promise((resolve, reject) => {
       let settled = false;
       const worker = new Worker(this.workerUrl, {
@@ -812,7 +867,7 @@ export class SamGovClient {
       if (cancel?.aborted) throw cancelled();
       // Network errors can carry the request URL (which contains the key); never pass them through raw.
       if (isTimeout(e)) throw new SamGovError(`SAM.gov did not respond within ${this.timeoutMs} ms.`, undefined, "TIMEOUT");
-      throw new SamGovError(`Could not reach SAM.gov: ${excerpt(String((e as Error)?.message ?? e), this.redact)}`, undefined, "NETWORK_ERROR");
+      throw new SamGovError(`Could not reach SAM.gov: ${excerpt(String((e as Error)?.message ?? e).slice(0, MAX_ERROR_BODY_BYTES), this.redact)}`, undefined, "NETWORK_ERROR");
     }
     // Per the Get Opportunities API docs, HTTP 404 means "No Data found", not an error. Release the body
     // without waiting for the cancellation to finish (a stalled cancel must not hold the result).
@@ -838,7 +893,7 @@ export class SamGovClient {
       if (cancel?.aborted) throw cancelled();
       if (e instanceof ResponseTooLarge) throw new SamGovError("SAM.gov response too large; narrow the search.", undefined, "RESPONSE_TOO_LARGE");
       if (isTimeout(e)) throw new SamGovError(`SAM.gov did not finish responding within ${this.timeoutMs} ms.`, undefined, "TIMEOUT");
-      throw new SamGovError(`Failed reading SAM.gov response: ${excerpt(String((e as Error)?.message ?? e), this.redact)}`, undefined, "NETWORK_ERROR");
+      throw new SamGovError(`Failed reading SAM.gov response: ${excerpt(String((e as Error)?.message ?? e).slice(0, MAX_ERROR_BODY_BYTES), this.redact)}`, undefined, "NETWORK_ERROR");
     }
   }
 
