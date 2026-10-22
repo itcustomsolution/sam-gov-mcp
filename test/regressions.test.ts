@@ -910,3 +910,46 @@ describe("r5 review (2026-10-17): split escapes the open-escape pattern did not 
     }
   });
 });
+
+describe("independent release review (2026-10-22): SAM-01..03", () => {
+  it("SAM-01: a key split by a literal JSON short escape (backslash n) is redacted, in results and in error excerpts", async () => {
+    for (const sep of ["\\n", "\\t", "\\/", "\\\\", '\\"']) {
+      const title = KEY.slice(0, 10) + sep + KEY.slice(10);
+      const r = await new SamGovClient(KEY, reply(200, envelope([opp("a1", { title })], 1, { limit: 10, offset: 0 })) as any).search(range);
+      expect(JSON.stringify(r)).not.toContain(KEY.slice(12, 30));
+      expect(r.results[0].title).toBe("REDACTED");
+      const f = async () => ({ ok: false, status: 500, body: streamOf(`upstream failure: ${title}`) });
+      await expect(new SamGovClient(KEY, f as any).search(range)).rejects.toThrow(/500.*REDACTED/);
+    }
+    // Doubly escaped: "\\u0053" written with a literal backslash-backslash decodes in two rounds.
+    const twice = KEY.slice(0, 10) + "\\\\u00" + KEY.charCodeAt(10).toString(16).padStart(2, "0") + KEY.slice(11);
+    const r2 = await new SamGovClient(KEY, reply(200, envelope([opp("a1", { title: twice })], 1, { limit: 10, offset: 0 })) as any).search(range);
+    expect(r2.results[0].title).toBe("REDACTED");
+    // Control: ordinary text with short escapes is kept.
+    const r3 = await new SamGovClient(KEY, reply(200, envelope([opp("a1", { title: "line one\\nline two \\/ path" })], 1, { limit: 10, offset: 0 })) as any).search(range);
+    expect(r3.results[0].title).toBe("line one\\nline two \\/ path");
+  });
+
+  it("SAM-02: a body of very many tiny chunks is refused by count, and the deadline still fires on an endless empty stream", async () => {
+    const many = new ReadableStream<Uint8Array>({ pull(c) { c.enqueue(new Uint8Array(0)); } });
+    const f = async () => ({ ok: true, status: 200, body: many });
+    const t0 = Date.now();
+    await expect(new SamGovClient(KEY, f as any).search(range)).rejects.toMatchObject({ code: "RESPONSE_TOO_LARGE" });
+    expect(Date.now() - t0).toBeLessThan(10_000);
+    // With a short deadline the deadline wins before the chunk bound on a slow-but-endless stream.
+    let n = 0;
+    const slow = new ReadableStream<Uint8Array>({ async pull(c) { n++; await new Promise((r) => setTimeout(r, 1)); c.enqueue(new Uint8Array(1)); } });
+    const t1 = Date.now();
+    await expect(new SamGovClient(KEY, (async () => ({ ok: true, status: 200, body: slow })) as any, undefined, 100).search(range)).rejects.toMatchObject({ code: "TIMEOUT" });
+    expect(Date.now() - t1).toBeLessThan(5_000);
+    expect(n).toBeGreaterThan(0);
+  });
+
+  it("SAM-03: an already-cancelled call never invokes the transport, even one that would answer 404", async () => {
+    const f = vi.fn(async () => ({ ok: false, status: 404, body: null }));
+    const ac = new AbortController();
+    ac.abort();
+    await expect(new SamGovClient(KEY, f as any).search(range, { signal: ac.signal })).rejects.toMatchObject({ code: "CANCELLED" });
+    expect(f).not.toHaveBeenCalled();
+  });
+});

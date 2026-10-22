@@ -262,7 +262,7 @@ export const MAX_DECODE_ROUNDS = 8;
  * leading zeros it has, and a named HTML entity. Each percent byte is its own token, so in "%35%67" either may be read
  * as written while the other is decoded. Groups 1 and 2 are a numeric entity's hex and decimal digits.
  */
-const ESCAPE = /%[c-f][0-9a-f](?:%[89ab][0-9a-f]){1,3}|%[0-9a-f]{2}|\\u[0-9a-f]{4}|&#(?:x0*([0-9a-f]+)|0*(\d+));?|&[a-z][a-z0-9]{1,31};/gi;
+const ESCAPE = /%[c-f][0-9a-f](?:%[89ab][0-9a-f]){1,3}|%[0-9a-f]{2}|\\u[0-9a-f]{4}|\\[bfnrt"\\/]|&#(?:x0*([0-9a-f]+)|0*(\d+));?|&[a-z][a-z0-9]{1,31};/gi;
 /** Characters an upstream might insert, even inside an escape: after NFKC, anything but an ASCII letter or digit and
  * the characters escapes are written with ("%", "\\", "&", "#", ";"). */
 const INSERTED = /[^A-Za-z0-9%\\&#;]/g;
@@ -271,6 +271,9 @@ const INSERTED_EXCEPT_CONTROL = /[^A-Za-z0-9%\\&#;\x00-\x1f]/g;
 const OUT_OF_RANGE = Symbol("numeric entity beyond U+10FFFF");
 /** The letters JSON writes for a control character that has a short escape; the others are written as \u00XX. */
 const JSON_ESCAPE: Record<number, string> = { 8: "b", 9: "t", 10: "n", 12: "f", 13: "r" };
+/** The JSON short escapes read as escapes too: a literal "\\n" in a value is one token, written or decoded (a doubly
+ * escaped reply, or a backslash and a letter inserted into the key). */
+const JSON_SHORT: Record<string, string> = { b: "\b", f: "\f", n: "\n", r: "\r", t: "\t", '"': '"', "\\": "\\", "/": "/" };
 /** Named entities for the characters escapes are written with, decoded so a doubly escaped key ("&amp;#83;") is read. */
 const NAMED: Record<string, string> = { amp: "&", num: "#", percnt: "%", bsol: "\\", semi: ";" };
 
@@ -283,7 +286,8 @@ function named(tok: string): string {
 
 function decodeEscape(tok: string, hex?: string, dec?: string): string | typeof OUT_OF_RANGE {
   if (tok[0] === "%") return UTF8.decode(Uint8Array.from(tok.slice(1).split("%"), (e) => parseInt(e, 16)));
-  if (tok[0] === "\\") return String.fromCharCode(parseInt(tok.slice(2), 16));
+  // Short escapes are case-sensitive in JSON; the case-insensitive token regex also matches "\\N", which is only itself.
+  if (tok[0] === "\\") return tok.length === 2 ? (JSON_SHORT[tok[1]] ?? tok) : String.fromCharCode(parseInt(tok.slice(2), 16));
   if (tok[1] !== "#") return named(tok);
   // The whole digit run: a bounded run would decode a prefix of "&#00000083;" and leave digits that hide a letter.
   const cp = hex !== undefined ? (hex.length > 6 ? Infinity : parseInt(hex, 16)) : (dec!.length > 7 ? Infinity : Number(dec));
@@ -300,6 +304,7 @@ function decodeOnce(t: string, dropOutOfRange = false, marks = false): string | 
   const out = t.replace(/%(?:25)+(?=[0-9a-f]{2})/gi, "%")
     .replace(/(?:%[0-9a-f]{2})+/gi, (run) => UTF8.decode(Uint8Array.from(run.slice(1).split("%"), (h) => parseInt(h, 16))))
     .replace(/\\u([0-9a-f]{4})/gi, (_m, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/\\([bfnrt"\\/])/g, (_m, c) => JSON_SHORT[c])
     .replace(/&#(?:x0*([0-9a-f]+)|0*(\d+));?/gi, (tok: string, h?: string, d?: string) => {
       const r = decodeEscape(tok, h, d);
       if (r !== OUT_OF_RANGE) return r;
@@ -665,16 +670,32 @@ function rejectOnAbort(signal: AbortSignal): Promise<never> {
  * that is still waiting when the signal aborts rejects with its reason, even if the stream ignores it.
  * Cancellation is started but never awaited, so a stalled cancel cannot delay the result.
  */
+export const MAX_BODY_CHUNKS = 65_536;
 export async function readCapped(body: ReadableStream<Uint8Array> | null, max: number, signal?: AbortSignal): Promise<string> {
   if (!body) return "";
   const reader = body.getReader();
   const decoder = new TextDecoder("utf-8");
   let total = 0;
+  let chunks = 0;
   let out = "";
-  const aborted = signal && rejectOnAbort(signal);
+  // One abort listener for the whole read, rejecting whichever read is pending: a Promise.race per chunk would leave a
+  // reaction on the abort promise for every chunk until the signal fires.
+  let rejectPending: ((reason: unknown) => void) | undefined;
+  const onAbort = () => rejectPending?.(signal!.reason);
+  signal?.addEventListener("abort", onAbort, { once: true });
+  const read = () => signal
+    ? new Promise<ReadableStreamReadResult<Uint8Array>>((resolve, reject) => { rejectPending = reject; reader.read().then(resolve, reject); })
+    : reader.read();
   try {
     for (;;) {
-      const { done, value } = await (aborted ? Promise.race([reader.read(), aborted]) : reader.read());
+      if (signal?.aborted) throw signal.reason;
+      // A body that arrives as many tiny or empty chunks is bounded by count, and yields so the deadline timer can run.
+      if (++chunks > MAX_BODY_CHUNKS) {
+        reader.cancel("response arrives in too many chunks").catch(() => {});
+        throw new ResponseTooLarge(`response arrives in more than ${MAX_BODY_CHUNKS} chunks`);
+      }
+      if ((chunks & 255) === 0) await new Promise<void>((r) => setImmediate(r));
+      const { done, value } = await read();
       if (done) break;
       total += value.byteLength;
       if (total > max) {
@@ -685,9 +706,11 @@ export async function readCapped(body: ReadableStream<Uint8Array> | null, max: n
     }
     return out + decoder.decode();
   } catch (e) {
-    if (aborted && signal?.aborted) reader.cancel(signal.reason).catch(() => {});
+    if (signal?.aborted) reader.cancel(signal.reason).catch(() => {});
     throw e;
   } finally {
+    signal?.removeEventListener("abort", onAbort);
+    rejectPending = undefined;
     try {
       reader.releaseLock?.();
     } catch {
@@ -893,6 +916,8 @@ export class SamGovClient {
     const cancelled = () => new SamGovError("The request was cancelled; nothing was returned.", undefined, "CANCELLED");
     let res;
     let pending: Promise<Awaited<ReturnType<FetchLike>>> | undefined;
+    if (cancel?.aborted) throw cancelled(); // already cancelled: the transport is not called at all
+    if (signal.aborted) throw new SamGovError(`SAM.gov did not respond within ${this.timeoutMs} ms.`, undefined, "TIMEOUT");
     try {
       // The deadline holds even for a fetch that ignores the signal; a reply that arrives later is released unread.
       pending = Promise.resolve(this.fetchImpl(url, { headers: { Accept: "application/json" }, signal }));

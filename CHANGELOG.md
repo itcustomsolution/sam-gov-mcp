@@ -1,6 +1,19 @@
 # Changelog
 
-## [0.2.0-rc.6] - unreleased candidate (2026-10-17, not published; 0.2.0-rc.5 and earlier were audited and are frozen)
+## [0.2.0] - 2026-10-22
+
+- Independent release review (2026-10-22), SAM-01: the key check also reads JSON short escapes (`\n`, `\t`, `\/`,
+  `\\`, `\"`) as escapes, written or decoded, so a key split by a literal backslash-and-letter in a value or an
+  error body is redacted.
+- SAM-02: reading a response body is bounded by chunk count (65,536) as well as bytes, yields to the event loop every
+  256 chunks so the deadline can fire on an endless stream of tiny chunks, and keeps one abort listener for the whole
+  read instead of one reaction per chunk.
+- SAM-03: a call whose cancellation signal is already aborted does not invoke the transport at all.
+- Live check (2026-10-22, real key, one day's sample): consecutive pages, a 100-record page, a notice lookup, an
+  unknown notice and an out-of-range page parsed as documented; no reply echoed the key. Observed: an unrecognized
+  key is answered with an empty HTTP 404, which this server reports as an empty result; README says so.
+
+### 0.2.0-rc.6 (2026-10-17, candidate)
 
 - R5-SAM-RES: checking a reply for the API key is bounded and stoppable. Everything after the body is read
   (JSON parsing, format checks, transformation-aware redaction) runs in a worker thread with a 256 MB heap limit

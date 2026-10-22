@@ -67,15 +67,19 @@ ID), `IDENTITY_MISMATCH` (a record for a different notice ID), `CANCELLED` (the 
 `INTERNAL_ERROR` (an unexpected failure inside this server). A `TIMEOUT` message says which step did not finish:
 the request, reading the body, or checking the reply. Arguments that fail the tool's input schema (for example `limit: 0`) are rejected by the MCP SDK
 before this server runs, as plain text, not JSON. HTTP 404 means "no data" per GSA and is an empty result; its
-body is released, not read.
+body is released, not read. Observed against the live service on 2026-10-22: an unrecognized `SAM_API_KEY` is also
+answered with an empty HTTP 404, so a wrong key looks like zero results (`total` 0) rather than an error, while a
+genuinely empty search returns HTTP 200 with `totalRecords: 0`. If every search returns nothing, check the key first.
 
 `INVALID_RESPONSE` means the body does not match the documented success format: an error-like field (`error`,
 `message`, `status`, `fault`, `warning` in any form) or any undocumented top-level field beside an empty page,
 `totalRecords`/`limit`/`offset` that are not integers or do not match the request, a page that is not full
 before the last page or not the remainder on the last page, or a record without a valid `noticeId` or with a
 summary field of the wrong type. One malformed record fails the whole page. The checks follow GSA's documented
-examples and this project's mocked tests. They have not been run against the live SAM.gov service in this
-release, so a live reply that GSA formats differently may be refused.
+examples and this project's mocked tests. On 2026-10-22 they were exercised once against the live service with a
+real key (two consecutive five-record pages, a 100-record page, one notice lookup, an unknown notice ID, an
+out-of-range page index and an invalid key); every reply parsed and no reply echoed the key. That is one day's
+sample, not continuous coverage, so a live reply that GSA formats differently may still be refused.
 
 ## Scope and limits
 
