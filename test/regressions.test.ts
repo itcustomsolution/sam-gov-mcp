@@ -945,6 +945,32 @@ describe("independent release review (2026-10-22): SAM-01..03", () => {
     expect(n).toBeGreaterThan(0);
   });
 
+  it("SAM-04: an abort that lands during the periodic yield stops the read instead of starting another", async () => {
+    let reads = 0;
+    const body = new ReadableStream<Uint8Array>({ pull(c) { reads++; if (reads <= 256) c.enqueue(new Uint8Array(0)); } });
+    const ac = new AbortController();
+    const orig = setImmediate;
+    const p = new SamGovClient(KEY, (async () => ({ ok: true, status: 200, body })) as any, undefined, 30_000).search(range, { signal: ac.signal });
+    // Abort on the next macrotask, which is where the 256th-chunk yield lands; a stalled read must not be started.
+    await new Promise<void>((r) => orig(() => { ac.abort(); r(); }));
+    await expect(p).rejects.toMatchObject({ code: "CANCELLED" });
+    expect(reads).toBeLessThanOrEqual(257);
+  });
+
+  it("SAM-05: exactly MAX_BODY_CHUNKS data chunks followed by EOF are read; one more is refused", async () => {
+    const { MAX_BODY_CHUNKS, readCapped } = await import("../src/samgov.js");
+    const mk = (n: number) => { let i = 0; return new ReadableStream<Uint8Array>({ pull(c) { if (i++ < n) c.enqueue(new Uint8Array([0x61])); else c.close(); } }); };
+    expect((await readCapped(mk(MAX_BODY_CHUNKS), 1 << 20)).length).toBe(MAX_BODY_CHUNKS);
+    await expect(readCapped(mk(MAX_BODY_CHUNKS + 1), 1 << 20)).rejects.toThrow(/chunks/);
+  });
+
+  it("SAM-06: a value made of many literal short escapes is still returned (no per-escape charge for two-character escapes)", async () => {
+    const title = "\\n".repeat(4000);
+    const r = await new SamGovClient(KEY, reply(200, envelope([opp("a1", { title }), opp("a2", { title }), opp("a3", { title }), opp("a4", { title })], 4, { limit: 10, offset: 0 })) as any).search(range);
+    expect(r.results.length).toBe(4);
+    expect(r.results[0].title).toBe(title);
+  });
+
   it("SAM-03: an already-cancelled call never invokes the transport, even one that would answer 404", async () => {
     const f = vi.fn(async () => ({ ok: false, status: 404, body: null }));
     const ac = new AbortController();

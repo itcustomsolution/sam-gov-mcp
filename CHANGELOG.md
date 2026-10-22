@@ -9,6 +9,10 @@
   256 chunks so the deadline can fire on an endless stream of tiny chunks, and keeps one abort listener for the whole
   read instead of one reaction per chunk.
 - SAM-03: a call whose cancellation signal is already aborted does not invoke the transport at all.
+- Re-review of the fixes (SAM-04 to SAM-06): an abort that lands during the periodic yield is seen before the next
+  read starts; the chunk bound counts data chunks only, not the end of the stream; two-character short escapes are
+  not charged the per-escape work unit, so a value made of many of them is still returned. A string that still
+  decodes after 8 rounds (more than 256 literal backslashes) is blanked; README says so.
 - Live check (2026-10-22, real key, one day's sample): consecutive pages, a 100-record page, a notice lookup, an
   unknown notice and an out-of-range page parsed as documented; no reply echoed the key. Observed: an unrecognized
   key is answered with an empty HTTP 404, which this server reports as an empty result; README says so.

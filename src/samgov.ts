@@ -394,7 +394,7 @@ function keyScanner(core: string, joined = false, budget?: Budget): Scanner {
     let hit = false, last = 0;
     spend(budget, t.length);
     for (const m of t.matchAll(ESCAPE)) {
-      spend(budget, budget?.perEscape ?? 0);
+      if (m[0].length > 2) spend(budget, budget?.perEscape ?? 0); // a two-character short escape costs no more than its characters
       hit = feed(d, t.slice(last, m.index)) || hit;
       const decoded = decodeEscape(m[0], m[1], m[2]);
       if (decoded !== OUT_OF_RANGE) { branch.set(d); hit = feed(branch, decoded) || hit; }
@@ -684,19 +684,23 @@ export async function readCapped(body: ReadableStream<Uint8Array> | null, max: n
   const onAbort = () => rejectPending?.(signal!.reason);
   signal?.addEventListener("abort", onAbort, { once: true });
   const read = () => signal
-    ? new Promise<ReadableStreamReadResult<Uint8Array>>((resolve, reject) => { rejectPending = reject; reader.read().then(resolve, reject); })
+    ? new Promise<ReadableStreamReadResult<Uint8Array>>((resolve, reject) => {
+      if (signal.aborted) return reject(signal.reason); // aborted since the last read: never start another
+      rejectPending = reject;
+      reader.read().then(resolve, reject);
+    })
     : reader.read();
   try {
     for (;;) {
-      if (signal?.aborted) throw signal.reason;
-      // A body that arrives as many tiny or empty chunks is bounded by count, and yields so the deadline timer can run.
+      // A body that arrives as many tiny or empty chunks yields every 256 chunks so the deadline timer can run; the
+      // abort check in read() comes after the yield, so an abort during it is not lost.
+      if (chunks > 0 && (chunks & 255) === 0) await new Promise<void>((r) => setImmediate(r));
+      const { done, value } = await read();
+      if (done) break;
       if (++chunks > MAX_BODY_CHUNKS) {
         reader.cancel("response arrives in too many chunks").catch(() => {});
         throw new ResponseTooLarge(`response arrives in more than ${MAX_BODY_CHUNKS} chunks`);
       }
-      if ((chunks & 255) === 0) await new Promise<void>((r) => setImmediate(r));
-      const { done, value } = await read();
-      if (done) break;
       total += value.byteLength;
       if (total > max) {
         reader.cancel("response exceeds size cap").catch(() => {});
