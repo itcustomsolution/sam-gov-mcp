@@ -389,11 +389,12 @@ function keyScanner(core: string, joined = false, budget?: Budget): Scanner {
     }
     return hit;
   };
-  const scanRound = (t: string, start: Uint32Array, end: Uint32Array): boolean => {
+  const scanRound = (t: string, start: Uint32Array, end: Uint32Array): { hit: boolean; hasBackslashPair: boolean } => {
     const d = start.slice(), branch = new Uint32Array(words);
-    let hit = false, last = 0;
+    let hit = false, last = 0, hasBackslashPair = false;
     spend(budget, t.length);
     for (const m of t.matchAll(ESCAPE)) {
+      if (m[0] === "\\\\") hasBackslashPair = true;
       if (m[0].length > 2) spend(budget, budget?.perEscape ?? 0); // a two-character short escape costs no more than its characters
       hit = feed(d, t.slice(last, m.index)) || hit;
       const decoded = decodeEscape(m[0], m[1], m[2]);
@@ -404,7 +405,7 @@ function keyScanner(core: string, joined = false, budget?: Budget): Scanner {
     }
     hit = feed(d, t.slice(last)) || hit;
     for (let w = 0; w < words; w++) end[w] |= d[w];
-    return hit;
+    return { hit, hasBackslashPair };
   };
   return (s, start = none) => {
     const end = new Uint32Array(words);
@@ -425,15 +426,28 @@ function keyScanner(core: string, joined = false, budget?: Budget): Scanner {
       // followed by a mark is still that letter; a precomposed letter ("é") stays one character, which is then removed.
       let t = removed ? s.replace(MARKS, "").normalize("NFKC").replace(removed, "") : s.normalize("NFKC");
       if (t.length > limit) throw tooComplex("grows too much when normalized to be checked for the API key");
-      for (let round = 0; ; round++) {
-        hit = scanRound(t, start, end) || hit;
+      // Pure backslash contraction is scanned at every step but consumes no semantic decode depth.
+      // Its strict length reduction and the existing character budget still bound the work.
+      for (let round = 0; ; ) {
+        const scanned = scanRound(t, start, end);
+        hit = scanned.hit || hit;
         spend(budget, t.length);
         let next = decodeOnce(t, strip || joined, strip);
         if (next !== undefined && next.length > limit) throw tooComplex("grows too much when decoded to be checked for the API key");
         if (next === undefined) return { hit: true, end };
         if (removed) next = next.replace(removed, "");
         if (next === t) break;
-        if (round === MAX_DECODE_ROUNDS) return { hit: true, end };
+        // Only a literal backslash pair can contract without changing the collapsed text.
+        // Reuse the charged escape scan; do not rescan unrelated decoding rounds.
+        let literalContraction = false;
+        if (scanned.hasBackslashPair) {
+          spend(budget, 2 * t.length + next.length);
+          const collapse = (text: string) => text.replace(/\\+/g, "\\");
+          literalContraction = next.length < t.length && collapse(t) === collapse(next);
+        }
+        // Continue scanning after contraction: a short escape may expose another encoded key.
+        // Every other changing decode retains the original fail-closed depth limit.
+        if (!literalContraction && round++ === MAX_DECODE_ROUNDS) return { hit: true, end };
         t = next;
       }
     }

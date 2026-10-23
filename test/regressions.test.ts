@@ -979,3 +979,26 @@ describe("independent release review (2026-10-22): SAM-01..03", () => {
     expect(f).not.toHaveBeenCalled();
   });
 });
+
+
+// SAM-06 follow-up: preserve key-free literal backslashes without admitting delayed key escapes.
+describe("SAM-06: literal backslash-only contraction at the decode ceiling", () => {
+  for (const count of [257, 512, 4096]) {
+    it(`preserves ${count} literal backslashes, including joined-field checking`, () => {
+      const title = "Ordinary [" + "\\".repeat(count) + "]";
+      expect(redactKey(title, KEY)).toBe(title);
+      expect(redactDeep({ title, note: "ordinary" }, KEY)).toEqual({ title, note: "ordinary" });
+    });
+  }
+  it("still redacts a key exposed by a delayed short escape inside percent tokens", () => {
+    const hidden = [...KEY].map((c) => {
+      const hex = c.charCodeAt(0).toString(16).padStart(2, "0");
+      return "%" + hex[0] + "\\".repeat(512) + "n" + hex[1];
+    }).join("");
+    expect(redactKey(hidden, KEY)).toBe("REDACTED");
+  });
+  it("still refuses a key hidden behind delayed Unicode escapes", () => {
+    const hidden = [...KEY].map((c) => "\\".repeat(512) + "u" + c.charCodeAt(0).toString(16).padStart(4, "0")).join("");
+    expect(redactKey(hidden, KEY)).toBe("REDACTED");
+  });
+});
