@@ -425,7 +425,9 @@ function keyScanner(core: string, joined = false, budget?: Budget): Scanner {
       // followed by a mark is still that letter; a precomposed letter ("é") stays one character, which is then removed.
       let t = removed ? s.replace(MARKS, "").normalize("NFKC").replace(removed, "") : s.normalize("NFKC");
       if (t.length > limit) throw tooComplex("grows too much when normalized to be checked for the API key");
-      for (let round = 0; ; round++) {
+      // Pure backslash contraction is scanned at every step but consumes no semantic decode depth.
+      // Its strict length reduction and the existing character budget still bound the work.
+      for (let round = 0; ; ) {
         hit = scanRound(t, start, end) || hit;
         spend(budget, t.length);
         let next = decodeOnce(t, strip || joined, strip);
@@ -433,7 +435,12 @@ function keyScanner(core: string, joined = false, budget?: Budget): Scanner {
         if (next === undefined) return { hit: true, end };
         if (removed) next = next.replace(removed, "");
         if (next === t) break;
-        if (round === MAX_DECODE_ROUNDS) return { hit: true, end };
+        spend(budget, 2 * t.length + next.length);
+        const collapse = (text: string) => text.replace(/\\+/g, "\\");
+        const literalContraction = next.length < t.length && collapse(t) === collapse(next);
+        // Continue scanning after contraction: a short escape may expose another encoded key.
+        // Every other changing decode retains the original fail-closed depth limit.
+        if (!literalContraction && round++ === MAX_DECODE_ROUNDS) return { hit: true, end };
         t = next;
       }
     }
