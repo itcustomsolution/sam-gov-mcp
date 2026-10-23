@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.2.1] - Unreleased
+
+- Pure contractions of literal backslash pairs no longer consume the eight semantic decoding rounds. Every intermediate form is still scanned, including short and Unicode escapes exposed later.
+- Reuse the existing escape scan to avoid unnecessary collapse comparisons on unrelated decode rounds. Default work, growth, memory and deadline limits are unchanged; oversized work remains a refusal.
+
 ## [0.2.0] - 2026-10-22
 
 - Independent release review (2026-10-22), SAM-01: the key check also reads JSON short escapes (`\n`, `\t`, `\/`,
