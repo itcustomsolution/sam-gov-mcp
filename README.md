@@ -10,16 +10,34 @@ An [MCP](https://modelcontextprotocol.io) server that lets AI assistants (Claude
 
 Requires Node.js 22 or later.
 
-## Quickstart
+## Release status
+
+As of **26 October 2026**, the [GitHub release is v0.2.1](https://github.com/itcustomsolution/sam-gov-mcp/releases/tag/v0.2.1), while the [published npm version is 0.2.0](https://www.npmjs.com/package/@itcustomsolution/sam-gov-mcp/v/0.2.0). The 0.2.1 GitHub release does **not** mean that npm has been updated. Its release notes describe the normalization correction; use the tagged source below to evaluate that version.
+
+The [0.2.1 preparation test run](https://github.com/itcustomsolution/sam-gov-mcp/actions/runs/39966872029) passed on its recorded revision. Tests mock HTTP; they do not establish continuing live SAM.gov availability. See [development](#development), the [changelog](CHANGELOG.md) and [MIT license](LICENSE).
+
+To build the tagged 0.2.1 source without an API key, use Node.js 22.12+ as required by the development dependencies (see [development](#development)):
+
+```sh
+git clone --branch v0.2.1 --depth 1 https://github.com/itcustomsolution/sam-gov-mcp.git
+cd sam-gov-mcp
+npm ci --ignore-scripts
+npm run build
+npm test
+```
+
+For that source build, configure your MCP client to run `node` with the absolute path to `dist/index.js`, and provide `SAM_API_KEY` through the client's local environment configuration. A key is required for live opportunity calls, not for the mocked tests. Do not commit the key or include it in an issue.
+
+## Quickstart (published npm 0.2.0)
 
 1. Get a free API key: sign in at [sam.gov](https://sam.gov) → Account Details → API Key.
 2. Install. Claude Code:
 
    ```bash
-   claude mcp add sam-gov -e SAM_API_KEY=your-key-here -- npx -y @itcustomsolution/sam-gov-mcp
+   claude mcp add sam-gov -e SAM_API_KEY=your-key-here -- npx -y @itcustomsolution/sam-gov-mcp@0.2.0
    ```
 
-   Or run it directly: `SAM_API_KEY=your-key-here npx -y @itcustomsolution/sam-gov-mcp`
+   Or run it directly: `SAM_API_KEY=your-key-here npx -y @itcustomsolution/sam-gov-mcp@0.2.0`
 
 3. Add it to your MCP client. Claude Desktop (`claude_desktop_config.json`):
 
@@ -28,7 +46,7 @@ Requires Node.js 22 or later.
      "mcpServers": {
        "sam-gov": {
          "command": "npx",
-         "args": ["-y", "@itcustomsolution/sam-gov-mcp"],
+         "args": ["-y", "@itcustomsolution/sam-gov-mcp@0.2.0"],
          "env": { "SAM_API_KEY": "your-key-here" }
        }
      }
