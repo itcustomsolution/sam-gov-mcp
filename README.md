@@ -12,7 +12,7 @@ Requires Node.js 22 or later.
 
 ## Release status
 
-As of **26 October 2026**, the [GitHub release is v0.2.1](https://github.com/itcustomsolution/sam-gov-mcp/releases/tag/v0.2.1), while the [published npm version is 0.2.0](https://www.npmjs.com/package/@itcustomsolution/sam-gov-mcp/v/0.2.0). The 0.2.1 GitHub release does **not** mean that npm has been updated. Its release notes describe the normalization correction; use the tagged source below to evaluate that version.
+As of **31 October 2026**, [v0.2.1 on GitHub](https://github.com/itcustomsolution/sam-gov-mcp/releases/tag/v0.2.1) and [0.2.1 on npm](https://www.npmjs.com/package/@itcustomsolution/sam-gov-mcp/v/0.2.1) are published. The GitHub release notes retain their earlier publication-time statement that npm was pending; the npm registry now independently lists 0.2.1. Source changes, GitHub releases and registry publication are separate states.
 
 The [0.2.1 preparation test run](https://github.com/itcustomsolution/sam-gov-mcp/actions/runs/39966872029) passed on its recorded revision. Tests mock HTTP; they do not establish continuing live SAM.gov availability. See [development](#development), the [changelog](CHANGELOG.md) and [MIT license](LICENSE).
 
@@ -28,16 +28,16 @@ npm test
 
 For that source build, configure your MCP client to run `node` with the absolute path to `dist/index.js`, and provide `SAM_API_KEY` through the client's local environment configuration. A key is required for live opportunity calls, not for the mocked tests. Do not commit the key or include it in an issue.
 
-## Quickstart (published npm 0.2.0)
+## Quickstart (published npm 0.2.1)
 
 1. Get a free API key: sign in at [sam.gov](https://sam.gov) → Account Details → API Key.
 2. Install. Claude Code:
 
    ```bash
-   claude mcp add sam-gov -e SAM_API_KEY=your-key-here -- npx -y @itcustomsolution/sam-gov-mcp@0.2.0
+   claude mcp add sam-gov -e SAM_API_KEY=your-key-here -- npx -y @itcustomsolution/sam-gov-mcp@0.2.1
    ```
 
-   Or run it directly: `SAM_API_KEY=your-key-here npx -y @itcustomsolution/sam-gov-mcp@0.2.0`
+   Or run it directly: `SAM_API_KEY=your-key-here npx -y @itcustomsolution/sam-gov-mcp@0.2.1`
 
 3. Add it to your MCP client. Claude Desktop (`claude_desktop_config.json`):
 
@@ -46,7 +46,7 @@ For that source build, configure your MCP client to run `node` with the absolute
      "mcpServers": {
        "sam-gov": {
          "command": "npx",
-         "args": ["-y", "@itcustomsolution/sam-gov-mcp@0.2.0"],
+         "args": ["-y", "@itcustomsolution/sam-gov-mcp@0.2.1"],
          "env": { "SAM_API_KEY": "your-key-here" }
        }
      }
@@ -151,6 +151,12 @@ sample, not continuous coverage, so a live reply that GSA formats differently ma
 - Responses over 5 MB are refused. Each call has a 30 s deadline that covers the request, reading the response
   body and checking it (see Resource limits); cleanup of an unused body is started but never waited for. An HTTP error status that arrived before the deadline is
   reported as `UPSTREAM_HTTP_ERROR`, with a note if its body could not be read in time.
+
+## Using results in a workflow
+
+Use notice IDs and source links to support a reviewer's next decision. This connector does not monitor amendments, verify eligibility, download the full solicitation or submit a bid. An MCP connection and a successful search do not establish that a procurement workflow is complete or accepted for live use.
+
+If your requirement extends to a defined work package or teaming role, see ITC's [pursuit and teaming scope](https://itcustomsolution.com/practices/bid-pursuit-teaming). Eligibility, responsibilities and delivery resources are reviewed for each engagement; using this tool creates no commitment or product access.
 
 ## Development
 
