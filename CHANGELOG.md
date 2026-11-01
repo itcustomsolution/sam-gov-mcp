@@ -1,6 +1,11 @@
 # Changelog
 
-## [0.2.1] - Unreleased
+## [0.2.2] - Prepared for release
+
+- Refresh package-page documentation and project links to match the public ITC documentation.
+- Clarify the tool's scope and the separately scoped services inquiry path; no runtime behavior changes.
+
+## [0.2.1] - 2026-10-27
 
 - Pure contractions of literal backslash pairs no longer consume the eight semantic decoding rounds. Every intermediate form is still scanned, including short and Unicode escapes exposed later.
 - Reuse the existing escape scan to avoid unnecessary collapse comparisons on unrelated decode rounds. Default work, growth, memory and deadline limits are unchanged; oversized work remains a refusal.
